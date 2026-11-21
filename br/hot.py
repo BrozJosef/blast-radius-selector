@@ -309,7 +309,7 @@ class _Server:
             code = 1
             try:
                 os.close(r)
-                res = self.grandchild(files, olds, ids, job.get("limits"), before)
+                res = self.grandchild(files, olds, ids, job.get("limits"), before, job.get("allow"))
                 _send(w, res)
                 code = 0
             except Cannot as e:
@@ -347,8 +347,13 @@ class _Server:
                     pass
         return res
 
-    def grandchild(self, files, olds, ids, limits, before):
+    def grandchild(self, files, olds, ids, limits, before, allow=None):
         npatched = 0
+        if allow:
+            from . import slices
+            slices.ALLOW.clear()
+            slices.ALLOW.update({k: set(v) for k, v in allow.items()})
+            slices.install()
         for rel, text in files.items():
             path = os.path.join(self.src, rel)
             try:
@@ -436,7 +441,7 @@ class Zygote:
     def total_cpu(self):
         return self.cpu_dead + self.cpu
 
-    def run(self, cid, files, ids, limits=None, timeout=60.0):
+    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None):
         """files: {relpath: full new source}. Returns (failing set | None, reason)."""
         if self.pid is None:
             try:
@@ -444,7 +449,8 @@ class Zygote:
             except OSError as e:
                 return None, "cannot start zygote: %r" % (e,)
         try:
-            _send(self.w, {"cid": cid, "files": files, "ids": list(ids), "limits": limits, "timeout": timeout})
+            _send(self.w, {"cid": cid, "files": files, "ids": list(ids), "limits": limits, "timeout": timeout,
+                           "allow": {k: sorted(v) for k, v in (allow or {}).items()}})
         except OSError as e:
             self.stop()
             return None, "zygote gone: %r" % (e,)

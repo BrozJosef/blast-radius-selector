@@ -52,3 +52,40 @@ def entries(filename, loader="load_sql_fixture_pairs", fixtures_dir=None):
         return list(fn(filename))
     finally:
         h.FIXTURES_DIR = old
+
+
+# ---- text-level entry splitting (mirrors tests/helpers.py at the pinned commit) -----------------
+def _filter_comments(s):
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def split_singles(text):
+    out = []
+    lines = []
+    for line in _filter_comments(text).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            out.append("\n".join(lines))
+            lines.clear()
+    return out
+
+
+def split_pairs(text):
+    st = _filter_comments(text).split(";")
+    out = []
+    for i in range(0, len(st), 2):
+        if i + 1 < len(st):
+            out.append((st[i].strip(), st[i + 1].strip()))
+    return out
+
+
+def changed_entries(old_text, new_text, singles):
+    """Indices of entries that differ, or None when the entry lists do not line up."""
+    f = split_singles if singles else split_pairs
+    try:
+        a, b = f(old_text), f(new_text)
+    except Exception:
+        return None
+    if len(a) != len(b):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}

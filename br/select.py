@@ -7,6 +7,8 @@ from array import array
 from . import patchlib, pydiff
 
 SRC = os.environ.get("BR_SRC", "/app/src")
+USE_VP = not os.environ.get("BR_NOVP")
+VP_INTERSECT = False
 PYTEST_CFG = ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".pytest.ini")
 
 
@@ -141,6 +143,72 @@ class Maps:
         return list(self.reads.get(name, ())) + list(self.strs.get(name, ()))
 
 
+_ORDER = {"<": 2, "<=": 3, ">": 4, ">=": 5}
+
+
+def _cmp_val(op, m):
+    """Value of `l op r` given a recorded operand pattern; None when unknown."""
+    if op == "is" or op == "is not":
+        v = m & 3
+        neg = op == "is not"
+    elif op == "==" or op == "!=":
+        v = (m >> 2) & 3
+        neg = op == "!="
+    elif op in _ORDER:
+        if m >> 4 == 0 and False:
+            return None
+        v = (m >> (2 * _ORDER[op])) & 3
+        neg = False
+    else:
+        return None
+    if v == 2:
+        return None
+    return (not v) if neg else bool(v)
+
+
+def infected(M, path, site, has_order_bits=None):
+    """Tests in which swapping the operator at `site` can change the value there; None = unknown."""
+    line, col, kind, old, new, n = site
+    info = M.vsite.get(path, {}).get((line, col))
+    if info is None:
+        return None
+    sid, skind, sop, sn, boolctx, pure = info
+    if skind != kind or (old is not None and sop != old):
+        return None
+    out = set()
+    if kind == "cmp":
+        if new is None or old is None:
+            return None
+        recs = M.vc.get(sid, {})
+        order_site = sop in _ORDER
+        for m, tb in recs.items():
+            if (new in _ORDER) and not order_site:
+                diff = True   # ordering was never recorded at an equality site
+            else:
+                a, b = _cmp_val(old, m), _cmp_val(new, m)
+                diff = a is None or b is None or a != b
+            if diff:
+                out.update(M.un(tb))
+        return out
+    recs = M.vb.get(sid, {})
+    if old is None or new is None or n != 2 or sn != 2 or not boolctx or not pure:
+        for m, tb in recs.items():
+            out.update(M.un(tb))   # any evaluation of the expression
+        return out
+    # two operands, used only for truth: `a and b` vs `a or b`
+    for m, tb in recs.items():
+        i, t = divmod(m, 3)
+        if t == 2:
+            bad = True
+        elif old == "and":   # differs when a is falsy (b unknown) or b is falsy
+            bad = t == 0
+        else:                # `or` -> `and`: differs when a is truthy (b unknown) or b is truthy
+            bad = t == 1
+        if bad:
+            out.update(M.un(tb))
+    return out
+
+
 class Plan:
     def __init__(self):
         self.all = False
@@ -151,6 +219,13 @@ class Plan:
         self.no_exec = False     # execution cannot decide (e.g. binary patch)
         self.files = {}          # path -> new content (None = deleted)
         self.renames = []
+        self.import_probe = set()  # modules whose import may now raise
+        self.broad = set()         # what fails if such an import does raise
+        self.broad_all = False
+        self.lines = {}            # path -> old lines touched by in-function changes
+        self.lines_ok = True       # False when some change is not captured by `lines`
+        self.data_files = {}       # changed data file -> (old text, new text)
+        self.data_cands = set()    # candidates that read a changed data file (almost surely failing)
 
     def why(self, s):
         self.reasons.append(s)
@@ -273,12 +348,14 @@ def _file(fc, M, plan):
     if path.endswith(".py"):
         _python(path, src, content, M, plan)
     else:
+        plan.data_files[path] = (src, content)
         _data(path, M, plan)
 
 
 def _data(path, M, plan):
     r = M.readers(path)
     plan.cands |= r
+    plan.data_cands |= r
     plan.why("%s: data file -> %d readers" % (path, len(r)))
     base = os.path.basename(path)
     if base in PYTEST_CFG or path in M.collect_files:
@@ -379,6 +456,18 @@ def _python(path, old, new, M, plan):
     for fc in md.funcs:
         lines = set(range(fc.start, fc.end + 1)) if (fc.whole or fc.header or fc.doc_only) else set(fc.lines)
         c = M.cover(path, lines)
+        if USE_VP and fc.sites and not (fc.other or fc.whole or fc.header or fc.doc_only):
+            inf = set()
+            for site in fc.sites:
+                r = infected(M, path, site)
+                if r is None:
+                    inf = None
+                    break
+                inf |= r
+            if inf is not None:
+                plan.why("%s:%s operator swap: %d of %d covering tests can see a different value" % (path, fc.qual, len(inf & c), len(c)))
+                inf |= set(M.un(M.vp_bad)) & c   # tests that could not be profiled
+                c = inf & c if VP_INTERSECT else inf
         imp_mods = set()
         d = M.imp.get(path, {})
         span = range(fc.start, fc.end + 1)
@@ -392,13 +481,20 @@ def _python(path, old, new, M, plan):
             plan.overlay = True
             for m in imp_mods:
                 c |= M.dependents(m, transitive=False)
+                plan.import_probe.add(m)
+                plan.broad |= M.dependents(m, transitive=True)
+                if m in M.eager or m.startswith("tests/"):
+                    plan.broad_all = True
             plan.why("%s:%s import-executed via %s" % (path, fc.qual, sorted(imp_mods)[:4]))
+            plan.lines_ok = False
         else:
             plan.hot.append((path, fc))
+            plan.lines.setdefault(path, set()).update(lines)
         plan.cands |= c
         plan.why("%s:%s lines %s -> %d" % (path, fc.qual, sorted(lines)[:6], len(c)))
     for ic in md.imports:
         plan.overlay = True
+        plan.lines_ok = False
         c = _import_change(path, ic, M, plan)
         plan.cands |= c
 
@@ -417,6 +513,10 @@ def _import_change(path, ic, M, plan):
         plan.why("%s: test-side import-level change (%s) -> %d" % (path, ic.what, len(c)))
         return c
     broad = M.dependents(path, transitive=False)
+    plan.import_probe.add(path)
+    plan.broad |= M.dependents(path, transitive=True)
+    if path in M.eager:
+        plan.broad_all = True
     if ic.scope:
         fam = M.users_class(path, ic.scope)
     else:

@@ -5,6 +5,16 @@ import sys
 import unittest
 
 
+FAIL_FAST = True
+
+
+class _Abort(Exception):
+    pass
+
+
+MEMO_OK = True   # cleared when the patch touches test code
+
+
 class Timeout(BaseException):
     pass
 
@@ -14,6 +24,7 @@ class _Result(unittest.TestResult):
         super().__init__()
         self.bad = set()       # test ids (unittest id form) that failed
         self.bad_classes = set()
+        self.pool_broke_at = None
 
     def _mark(self, test):
         tid = getattr(test, "test_case", test)  # subtests point at their parent
@@ -36,10 +47,44 @@ class _Result(unittest.TestResult):
         super().addSubTest(test, subtest, err)
         if err is not None:
             self.bad.add(test.id())
+            if FAIL_FAST:
+                raise _Abort()  # verdict is known; skip the rest of this test
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        # a class-wide pool that broke during this test takes every later pool user down with it
+        if self.pool_broke_at is None:
+            pool = getattr(type(test), "pool", None)
+            if getattr(pool, "_broken", False):
+                self.pool_broke_at = test.id()
 
     def addUnexpectedSuccess(self, test):
         super().addUnexpectedSuccess(test)
         self._mark(test)
+
+
+class _PytestLikeHandler:
+    pass
+
+
+def install_logging():
+    """pytest attaches capture handlers to the root logger that format every record and re-raise
+    formatting errors, so a log call whose arguments cannot be rendered fails the test."""
+    import logging
+
+    class H(logging.Handler):
+        def emit(self, record):
+            self.format(record)
+
+        def handleError(self, record):
+            raise
+
+    root = logging.getLogger()
+    if not any(type(h).__name__ == "H" and getattr(h, "_br", False) for h in root.handlers):
+        h = H()
+        h._br = True
+        h.setFormatter(logging.Formatter("%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s"))
+        root.addHandler(h)
 
 
 def _alarm(signum, frame):
@@ -51,6 +96,7 @@ def run_ids(ids, limits=None, default_limit=60.0):
     failing = set()
     info = {}
     by_class = {}
+    install_logging()
     for tid in ids:
         f, c, m = tid.split("::")
         by_class.setdefault((f, c), []).append((m, tid))
@@ -60,6 +106,9 @@ def run_ids(ids, limits=None, default_limit=60.0):
         try:
             mod = importlib.import_module(modname)
             cls = getattr(mod, c)
+            if MEMO_OK and modname == "tests.test_executor":
+                from . import memo
+                memo.install(mod)
         except Timeout:
             raise
         except BaseException as e:  # import error -> every test in the file fails
@@ -108,6 +157,8 @@ def run_ids(ids, limits=None, default_limit=60.0):
             for m, tid in items:
                 failing.add(tid)
             info[f + "::" + c] = "class-level: %s" % sorted(res.bad_classes)
+        if res.pool_broke_at is not None:
+            info.setdefault("pool_broken", {})[f + "::" + c] = res.pool_broke_at.rsplit(".", 1)[-1]
     return failing, info
 
 

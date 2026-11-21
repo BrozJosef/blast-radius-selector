@@ -11,7 +11,7 @@ FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 class FuncChange:
-    __slots__ = ("qual", "start", "end", "lines", "whole", "header", "kind", "doc_only")
+    __slots__ = ("qual", "start", "end", "lines", "whole", "header", "kind", "doc_only", "sites", "other")
 
     def __init__(self, qual, start, end, kind="def"):
         self.qual = qual
@@ -22,6 +22,8 @@ class FuncChange:
         self.header = False
         self.kind = kind
         self.doc_only = False
+        self.sites = []     # operator swaps: (lineno, col, kind, old_op, new_op, n_operands)
+        self.other = False  # some change is not a recognised operator swap
 
     def __repr__(self):
         return "Func(%s %d-%d lines=%s whole=%s header=%s %s)" % (
@@ -55,6 +57,73 @@ class ModDiff:
 
 def _dump(n):
     return ast.dump(n)
+
+
+_CMP = {ast.Eq: "==", ast.NotEq: "!=", ast.Is: "is", ast.IsNot: "is not", ast.Lt: "<", ast.LtE: "<=",
+        ast.Gt: ">", ast.GtE: ">=", ast.In: "in", ast.NotIn: "not in"}
+
+
+def minimal_diffs(a, b, out):
+    """Collect the smallest differing (old, new) expression pairs of two same-shaped trees."""
+    if type(a) is not type(b):
+        out.append((a, b))
+        return
+    if isinstance(a, (ast.Compare, ast.BoolOp)):
+        # an operator swap is reported at this node, not at the operator token
+        if isinstance(a, ast.Compare):
+            same = len(a.ops) == len(b.ops) and _dump(a.left) == _dump(b.left) and \
+                [_dump(x) for x in a.comparators] == [_dump(x) for x in b.comparators]
+            if same and [type(o) for o in a.ops] != [type(o) for o in b.ops]:
+                out.append((a, b))
+                return
+        else:
+            if type(a.op) is not type(b.op):
+                out.append((a, b))
+                return
+    fa, fb = list(ast.iter_fields(a)), list(ast.iter_fields(b))
+    for (na, va), (nb, vb) in zip(fa, fb):
+        if isinstance(va, ast.AST) and isinstance(vb, ast.AST):
+            if _dump(va) != _dump(vb):
+                minimal_diffs(va, vb, out)
+        elif isinstance(va, list) and isinstance(vb, list):
+            if len(va) != len(vb):
+                out.append((a, b))
+                return
+            for x, y in zip(va, vb):
+                if isinstance(x, ast.AST) and isinstance(y, ast.AST):
+                    if _dump(x) != _dump(y):
+                        minimal_diffs(x, y, out)
+                elif x != y:
+                    out.append((a, b))
+                    return
+        elif va != vb:
+            out.append((a, b))
+            return
+
+
+def op_sites(a, b):
+    """If old/new differ only by comparison/boolean operator swaps, return their sites, else None."""
+    out = []
+    try:
+        minimal_diffs(a, b, out)
+    except RecursionError:
+        return None
+    if not out:
+        return None
+    sites = []
+    for x, y in out:
+        if isinstance(x, ast.Compare) and isinstance(y, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1:
+            sites.append((x.lineno, x.col_offset, "cmp", _CMP.get(type(x.ops[0])), _CMP.get(type(y.ops[0])), 2))
+        elif isinstance(x, ast.BoolOp) and isinstance(y, ast.BoolOp) and len(x.values) == 2 and len(y.values) == 2 \
+                and [_dump(v) for v in x.values] == [_dump(v) for v in y.values]:
+            sites.append((x.lineno, x.col_offset, "bool", "and" if isinstance(x.op, ast.And) else "or",
+                          "and" if isinstance(y.op, ast.And) else "or", 2))
+        elif isinstance(x, ast.BoolOp):
+            # reshaped boolean chain: anything that evaluates the old expression may differ
+            sites.append((x.lineno, x.col_offset, "bool", None, None, len(x.values)))
+        else:
+            return None
+    return sites
 
 
 class _NoLambda(ast.NodeTransformer):
@@ -198,6 +267,11 @@ class _Differ:
                         if _dump(x.args) != _dump(y.args):
                             fc.header = True
                         fc.lines.update(range(x.lineno, x.end_lineno + 1))
+                        st = op_sites(x.body, y.body)
+                        if st:
+                            fc.sites.extend(st)
+                        else:
+                            fc.other = True
                         self.md.funcs.append(fc)
                 return
         na, nb = _targets(a), _targets(b)
@@ -267,6 +341,7 @@ class _Differ:
                     self.stmt_func(a, b, fc)
             else:
                 # insertion / deletion of statements: lines of removed stmts plus neighbours
+                fc.other = True
                 for a in o:
                     fc.lines.update(range(a.lineno, a.end_lineno + 1))
                 if i1 > 0:
@@ -293,6 +368,11 @@ class _Differ:
                 # header differs: header lines; bodies may differ too
                 first = a.body[0].lineno if a.body else a.end_lineno
                 fc.lines.update(range(a.lineno, max(a.lineno, first - 1) + 1))
+                st = op_sites(a.test, b.test) if isinstance(a, (ast.If, ast.While)) else None
+                if st:
+                    fc.sites.extend(st)
+                else:
+                    fc.other = True
                 for fa, fb in self._subbodies(a, b):
                     self.body_func(fa, fb, fc, a)
                 return
@@ -300,6 +380,11 @@ class _Differ:
                 self.body_func(a.body, b.body, fc, a)
                 return
         fc.lines.update(range(a.lineno, a.end_lineno + 1))
+        st = op_sites(a, b) if type(a) is type(b) else None
+        if st:
+            fc.sites.extend(st)
+        else:
+            fc.other = True
 
 
 def diff_module(old_src, new_src):
