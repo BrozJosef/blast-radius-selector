@@ -1,19 +1,20 @@
-Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
-2haz cost 25454 n 4 sqlglot/dialects/dialect.py:Dialect.case_sensitive lines [1278, 1279, 1280, 1281, 1282] -> 86
-Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
-2jrq cost 25454 n 9 sqlglot/optimizer/eliminate_joins.py:_should_eliminate_join lines [63, 64, 65, 66, 67, 68] -> 29
+2haz cost 25454 n 86 sqlglot/dialects/dialect.py:Dialect.case_sensitive lines [1278, 1279, 1280, 1281, 1282] -> 86
+2jrq cost 25454 n 29 sqlglot/optimizer/eliminate_joins.py:_should_eliminate_join lines [63, 64, 65, 66, 67, 68] -> 29
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
 2qn5 cost 0 n 0 sqlglot/generators/clickhouse.py:ClickHouseGenerator.timestamptrunc_sql lines [811] -> 6
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
 2vdj cost 2083 n 1 tests/fixtures/optimizer/pushdown_predicates.sql: data file -> 1 readers
 3utz cost 25454 n 37 sqlglot/serde.py:dump lines [53] -> 37
-4d63 cost 9078 n 273 sqlglot/dialects/snowflake.py[Snowflake.Tokenizer]: changed Assign ['NUMERIC_ESCAPES'] import-time readers -> 273
+Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
+'OPTIMIZE t FULL' contains unsupported syntax. Falling back to parsing as a 'Command'.
+'OPTIMIZE t' contains unsupported syntax. Falling back to parsing as a 'Command'.
+'OPTIMIZE t' contains unsupported syntax. Falling back to parsing as a 'Command'.
+'OPTIMIZE t' contains unsupported syntax. Falling back to parsing as a 'Command'.
+4d63 cost 0 n 0 sqlglot/dialects/snowflake.py[Snowflake.Tokenizer]: changed Assign ['NUMERIC_ESCAPES'] import-time readers -> 273
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
 535z cost 2596 n 1 sqlglot/dialects/tsql.py[TSQL]: changed Assign ['WEEK_OFFSET'] runtime readers 10 -> 7
-Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
-5y72 cost 0 n 0 sqlglot/optimizer/eliminate_subqueries.py:_eliminate_cte lines [176] -> 3
-Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
-66ks cost 23454 n 1 sqlglot/executor/context.py:Context.table lines [53] -> 51
+5y72 cost 2466 n 3 sqlglot/optimizer/eliminate_subqueries.py:_eliminate_cte lines [176] -> 3
+66ks cost 24787 n 51 sqlglot/executor/context.py:Context.table lines [53] -> 51
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
 6vvp cost 2037 n 1 tests/fixtures/optimizer/qualify_columns__invalid.sql: data file -> 1 readers
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
@@ -52,4 +53,4 @@ Unable to set __version__, run `pip install -e .` or `python setup.py develop` f
 rszg cost 5764 n 3 sqlglot/optimizer/scope.py: AST-identical -> 0 source readers| sqlglot/typing/snowflake.py:_annotate_within_group lines [98, 99, 100, 101, 102, 103] -> 2| tests/fixtures/optimizer/qualify_columns_ddl.sql: data file -> 1 readers
 Unable to set __version__, run `pip install -e .` or `python setup.py develop` first.
 st8f cost 2008 n 1 tests/fixtures/optimizer/isolate_table_selects.sql: data file -> 1 readers
-done in 73.21s
+done in 25.15s

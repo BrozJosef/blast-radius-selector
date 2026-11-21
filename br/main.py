@@ -20,8 +20,10 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 DEBUG = os.environ.get("BR_DEBUG")
 
 # policy knobs
-RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "1200"))    # never execute a test slower than this
-RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "6000"))  # nor a batch bigger than this
+RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "4000"))    # never execute a test slower than this
+RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "12000"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.6"))   # offline CPU map -> expected CPU on the scorer
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # nor a batch bigger than this
 WALL_BUDGET = float(os.environ.get("BR_WALL", "150"))                  # stop executing after this many seconds
 NOEXEC = bool(os.environ.get("BR_NOEXEC"))
 
@@ -30,8 +32,36 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+_pre = set()
+
+
+def preimport(ids):
+    """Import third-party modules in the parent once, so every forked child inherits them."""
+    if "base" not in _pre:
+        _pre.add("base")
+        import unittest, unittest.mock, concurrent.futures, concurrent.futures.process, pickle, signal, importlib  # noqa
+        import logging, doctest, datetime, decimal, typing, enum, functools, itertools, collections, re, math, textwrap  # noqa
+    if "data" not in _pre and any(t.startswith(("tests/test_optimizer.py", "tests/test_executor.py")) for t in ids):
+        _pre.add("data")
+        try:
+            import duckdb
+            import numpy  # noqa
+            import pandas  # noqa
+            import pandas.testing  # noqa
+            _c = duckdb.connect
+
+            def _connect(*a, **k):
+                cfg = dict(k.pop("config", None) or {})
+                cfg.setdefault("threads", 1)
+                return _c(*a, config=cfg, **k)
+            duckdb.connect = _connect
+        except Exception as e:
+            log("preimport failed", repr(e))
+
+
 def execute(cid, plan, ids, limits, timeout):
     """Fork a child that runs `ids` against the patched tree. Returns failing set or None on trouble."""
+    preimport(ids)
     root = os.path.join(TMP, "ov_" + cid)
     try:
         overlay.build(SRC, root, plan.files, plan.renames)
@@ -121,12 +151,33 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         return [], plan
     if NOEXEC or plan.no_exec or time.time() - T0 > WALL_BUDGET:
         return [num_of[t] for t in cand_ids], plan
-    light = [t for t in cand_ids if secs_ms[num_of[t]] <= RUN_MAX_TEST_MS]
-    heavy = [t for t in cand_ids if secs_ms[num_of[t]] > RUN_MAX_TEST_MS]
-    total = sum(secs_ms[num_of[t]] for t in light)
-    if total > RUN_MAX_TOTAL_MS:
+    # Economics: executing a test costs its CPU; including it blindly costs its share of the
+    # busiest worker (+2 s per worker). Run the cheapest prefix that minimises the estimate.
+    cpu = M.cpu
+    order = sorted(cand_ids, key=lambda t: cpu.get(t, secs_ms[num_of[t]]))
+    best = (packer.pack({num_of[t] for t in order}, secs_ms)[1], 0)
+    run_ms = 80.0
+    classes = set()
+    for k, t in enumerate(order, 1):
+        c = cpu.get(t, secs_ms[num_of[t]]) * CPU_SCALE
+        if c > RUN_MAX_TEST_MS:
+            break
+        cl = t.rsplit("::", 1)[0]
+        if cl not in classes:
+            classes.add(cl)
+            run_ms += M.cpu_class.get(cl, 0) * CPU_SCALE
+        run_ms += c
+        if run_ms > RUN_MAX_TOTAL_MS:
+            break
+        rest = {num_of[x] for x in order[k:]}
+        est = run_ms + (packer.pack(rest, secs_ms)[1] if rest else P_FAIL * 2100)
+        if est <= best[0]:
+            best = (est, k)
+    light, heavy = order[:best[1]], order[best[1]:]
+    if not light:
         return [num_of[t] for t in cand_ids], plan
-    limits = {t: max(3.0, 20 * secs_ms[num_of[t]] / 1000.0) for t in light}
+    total = sum(cpu.get(t, secs_ms[num_of[t]]) for t in light)
+    limits = {t: max(3.0, 20 * max(cpu.get(t, 0), secs_ms[num_of[t]]) / 1000.0) for t in light}
     timeout = max(10.0, 6 * total / 1000.0 + 5.0)
     bad = execute(cid, plan, light, limits, timeout)
     if bad is None:
