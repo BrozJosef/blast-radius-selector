@@ -1028,6 +1028,15 @@ def main():
                 z.run("bench%d" % i, {}, ["tests/test_time.py::TestTime::test_format_time"], {}, 20.0)
         except Exception as e:
             log("bench failed", repr(e))
+    if os.environ.get("BR_OVBENCH"):
+        # calibration probe: cost of a child on a patched tree that runs one trivial test
+        try:
+            import types
+            pl = types.SimpleNamespace(files={"sqlglot/time.py": open(os.path.join(SRC, "sqlglot/time.py")).read()}, renames=(), import_probe=set())
+            for i in range(int(os.environ["BR_OVBENCH"])):
+                execute("bench%d" % i, pl, ["tests/test_time.py::TestTime::test_format_time"], {}, 20.0)
+        except Exception as e:
+            log("ovbench failed", repr(e))
     unknown_tests = {n for tid, n in num_of.items() if tid not in M.idx}
     if unknown_tests:
         log("tests unknown to the maps:", len(unknown_tests))
