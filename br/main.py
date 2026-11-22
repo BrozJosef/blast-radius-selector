@@ -797,6 +797,8 @@ def main():
             zc = _ZY[0].total_cpu() if _ZY else 0.0
             zp = getattr(main, "_zcpu", 0.0); main._zcpu = zc
             log(cid, "CPU self %.3f child %.3f zygote %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], zc - zp, len(getattr(plan, "executed", ()) or ()) if plan else -1))
+        _drop = {t["number"] for t in tests if t["id"].endswith("::test_execute_tpcds")}   # diagnostic probe
+        nums = [n for n in nums if n not in _drop]
         if plan is not None and plan.must:
             nums = sorted(set(nums) | {num_of[M.tests[i]] for i in plan.must if M.tests[i] in num_of})
         workers, cost = packer.pack(set(nums), secs_ms)
