@@ -1020,6 +1020,14 @@ def main():
     M = select.Maps(MAPS)
     cdir = os.path.join(DATA, "commits")
     out = []
+    if os.environ.get("BR_FORKBENCH"):
+        # calibration probe: cost of a warm-process job that runs one trivial test
+        try:
+            z = zygote()
+            for i in range(int(os.environ["BR_FORKBENCH"])):
+                z.run("bench%d" % i, {}, ["tests/test_time.py::TestTime::test_format_time"], {}, 20.0)
+        except Exception as e:
+            log("bench failed", repr(e))
     unknown_tests = {n for tid, n in num_of.items() if tid not in M.idx}
     if unknown_tests:
         log("tests unknown to the maps:", len(unknown_tests))
