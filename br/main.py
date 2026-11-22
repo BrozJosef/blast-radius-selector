@@ -888,6 +888,11 @@ def main():
             zc = _ZY[0].total_cpu() if _ZY else 0.0
             zp = getattr(main, "_zcpu", 0.0); main._zcpu = zc
             log(cid, "CPU self %.3f child %.3f zygote %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], zc - zp, len(getattr(plan, "executed", ()) or ()) if plan else -1))
+        if plan is not None and getattr(plan, "executed", None) is not None and not plan.all:
+            # diagnostic probe: drop unrun tests under one second (keep failed ones and data-file readers)
+            keep = {num_of[t] for t in (getattr(plan, "failed", None) or ()) if t in num_of}
+            keep |= {num_of[M.tests[i]] for i in plan.data_cands if M.tests[i] in num_of}
+            nums = sorted(n for n in nums if n in keep or secs_ms[n] >= 1000)
         if plan is not None and plan.must:
             nums = sorted(set(nums) | {num_of[M.tests[i]] for i in plan.must if M.tests[i] in num_of})
         workers, cost = packer.pack(set(nums), secs_ms)
