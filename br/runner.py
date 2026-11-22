@@ -123,7 +123,10 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-def cap_memory(extra=1536 << 20):
+MEMCAP_MB = int(_os.environ.get("BR_MEMCAP_MB", "2200"))   # 0 switches the cap off
+
+
+def cap_memory(extra=None):
     """Called in a freshly forked child: a runaway allocation in patched code must end as a
     MemoryError in that test (which then fails and is included), not as the container's memory
     limit. Also makes this child the kernel's first choice should memory run out anyway."""
@@ -132,6 +135,10 @@ def cap_memory(extra=1536 << 20):
             f.write("1000")
     except Exception:
         pass
+    if extra is None:
+        extra = MEMCAP_MB << 20
+    if not extra:
+        return
     try:
         import resource
         data = 0
@@ -140,6 +147,8 @@ def cap_memory(extra=1536 << 20):
                 if line.startswith("VmData:"):
                     data = int(line.split()[1]) * 1024
                     break
+        if not data:
+            return                       # cannot tell what is already in use: leave the limit alone
         soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
         want = data + extra
         if hard != resource.RLIM_INFINITY:
