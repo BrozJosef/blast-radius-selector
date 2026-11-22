@@ -39,8 +39,8 @@ SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
 INDEPENDENT = ("::test_generator_memory", "::test_cache_does_not_retain_queries")
 SECS_CAP = float(os.environ.get("BR_SECS_CAP", "0"))
-PROBE_N = int(os.environ.get("BR_PROBE_N", "0"))
-PROBE_FRAC = float(os.environ.get("BR_PROBE_FRAC", "0.5"))
+PROBE_N = int(os.environ.get("BR_PROBE_N", "6"))
+PROBE_FRAC = float(os.environ.get("BR_PROBE_FRAC", "0.34"))
 P_FAIL_PROBED = float(os.environ.get("BR_P_FAIL_PROBED", "0.9"))
 MISS_COST = 1500.0   # ms of real executor runs allowed after memo misses (memo.MISS_BUDGET)
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
@@ -268,7 +268,7 @@ _ST = []
 
 _CK = []
 NORULES = bool(os.environ.get("BR_NORULES"))
-NOCK = not os.environ.get("BR_CK")   # constant-read narrowing: no gain on practice, off
+NOCK = bool(os.environ.get("BR_NOCK"))   # constant-read narrowing (gated on spared verification CPU)
 CK_MIN_SAVE_MS = float(os.environ.get("BR_CK_MIN_SAVE_MS", "5000"))
 
 
