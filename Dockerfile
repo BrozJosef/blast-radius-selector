@@ -13,7 +13,7 @@ ENV PYTHONHASHSEED=0
 COPY br /app/br
 COPY maps /app/maps
 RUN python -m compileall -q /app/br \
- && cd /app/src && PYTHONPATH=/app:/app/src SKIP_INTEGRATION=0 python -m br.memo 2>&1 | grep -v "unsupported syntax\|__version__" ; PYTHONPATH=/app:/app/src python -m br.fingerprint 2>&1 | grep -v "__version__" ; chmod -R a+rX /app
+ && cd /app/src && PYTHONPATH=/app:/app/src SKIP_INTEGRATION=0 python -m br.memo 2>&1 | grep -v "unsupported syntax\|__version__" ; PYTHONPATH=/app:/app/src SKIP_INTEGRATION=0 python -m br.rulememo 2>&1 | grep -v "unsupported syntax\|__version__" ; PYTHONPATH=/app:/app/src python -m br.fingerprint 2>&1 | grep -v "__version__" ; chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 WORKDIR /app
 CMD ["python", "-m", "br.main"]

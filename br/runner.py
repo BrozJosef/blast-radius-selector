@@ -73,6 +73,9 @@ class _Result(unittest.TestResult):
 
     def startTest(self, test):
         super().startTest(test)
+        m = sys.modules.get("br.memo")
+        if m is not None:
+            m.SPENT[0] = 0.0     # the memo-miss budget is per test
         lim = self.limits.get(test.id(), self.default_limit)
         signal.setitimer(signal.ITIMER_REAL, lim)
 

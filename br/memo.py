@@ -7,6 +7,7 @@ patched transpiler at run time, and any text not seen before is executed for rea
 """
 import os
 import pickle
+import time
 
 PATH = os.environ.get("BR_MEMO", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "duck_memo.pkl"))
 MEMO = None
@@ -57,6 +58,9 @@ def install(mod):
                     install_query()
                 else:
                     install_exec()
+                    if isinstance(EXEC_OK, str) and EXEC_OK.startswith("R"):
+                        from . import rulememo
+                        rulememo.install({int(x) for x in EXEC_OK[2:].split(",") if x})
             except Exception:
                 pass
 
@@ -153,6 +157,14 @@ def _read_rows(mod):
 # directly (never through sqlglot's own equality, hashing or SQL generation, which a patch may touch).
 # The memo is used only when the patch cannot reach any line the executor stage runs.
 EXEC_OK = False
+SPENT = [0.0]           # CPU seconds of real executor runs after memo misses, per test
+MISS_BUDGET = float(os.environ.get("BR_MISS_BUDGET", "1.5"))
+
+
+class GiveUp(BaseException):
+    pass
+
+
 STAGE_PATH = os.path.join(os.path.dirname(PATH), "exec_stage.pkl")
 _PRIM = (type(None), bool, int, float, str, bytes)
 
@@ -254,15 +266,22 @@ def install_exec(record=None, stage=None):
             blob = memo.get(k)
             if blob is not None:
                 return pickle.loads(blob)
+        if record is None and k is not None and SPENT[0] > MISS_BUDGET:
+            # the patch changes the plans of many queries: confirming each result would cost more
+            # than including the test, so stop here (the test errors and is reported as failing)
+            raise GiveUp()
         depth[0] += 1
         if stage is not None:
             stage[0] += 1
+        t0 = time.process_time() if record is None else 0.0
         try:
             res = orig(self, plan, outer_scope)
         finally:
             depth[0] -= 1
             if stage is not None:
                 stage[0] -= 1
+            if record is None and k is not None:
+                SPENT[0] += time.process_time() - t0
         if record is not None and k is not None:
             try:
                 record[k] = pickle.dumps(res, protocol=5)
@@ -274,6 +293,18 @@ def install_exec(record=None, stage=None):
     cls._br_exec = True
 
 
+def qkey(sql, schema, dialect, tables):
+    """Structural key of one top-level execute() call; None when it cannot be keyed."""
+    import hashlib
+    if isinstance(sql, str) or dialect is not None or type(tables) is not dict:
+        return None
+    seen = ({}, set())
+    r = repr((_key(sql, seen), _key(schema, seen), _key(tables, seen)))
+    if "'?'" in r:
+        return None
+    return hashlib.sha1(r.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def install_query(record=None, stage=None):
     """Level A: memoise sqlglot.executor.execute(expression, schema, tables) on the parsed query."""
     import hashlib
@@ -283,15 +314,6 @@ def install_query(record=None, stage=None):
     orig = se.execute
     memo = _load().get("__query__", {}) if record is None else None
     depth = [0]
-
-    def qkey(sql, schema, dialect, tables):
-        if isinstance(sql, str) or dialect is not None or type(tables) is not dict:
-            return None
-        seen = ({}, set())
-        r = repr((_key(sql, seen), _key(schema, seen), _key(tables, seen)))
-        if "'?'" in r:
-            return None
-        return hashlib.sha1(r.encode("utf-8", "surrogatepass")).hexdigest()
 
     def execute(sql, schema=None, dialect=None, tables=None):
         if depth[0]:

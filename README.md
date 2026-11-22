@@ -35,6 +35,13 @@ How it works:
    result keyed by a structural key of the query or plan. A cache level is
    used only when no changed line can run inside the stage it replaces.
 
+   `br/rulememo.py` adds a finer level for patches that can only reach code
+   inside optimizer rules: each touched rule is re-run on its recorded input
+   (unchanged code produced it) and, while its output digest matches the
+   recorded one, the recorded result stands. Real executor runs after memo
+   misses are capped per test; past the cap the test is reported as failing
+   (included) instead of being waited for.
+
 7. `br/fingerprint.py` digests the state importing sqlglot leaves behind (class
    attributes, module globals, closure contents, default arguments). The same
    digest of the pinned tree is taken at image build time. When a patch changes

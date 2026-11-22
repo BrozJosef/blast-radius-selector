@@ -128,18 +128,23 @@ class Walker:
             if isinstance(o, _lg.Handler):
                 return ("logh", t.__name__, o.level)
         if mod.startswith("sqlglot"):
-            d = None
+            # instance state lives in __dict__ and/or in slots declared anywhere along the MRO (a
+            # subclass without __slots__ has an empty __dict__ next to its bases' slots)
+            d = {}
+            for c in t.__mro__:
+                sl = c.__dict__.get("__slots__", ()) or ()
+                for s_ in ((sl,) if isinstance(sl, str) else sl):
+                    if isinstance(s_, str) and s_ not in ("__dict__", "__weakref__"):
+                        try:
+                            d[s_] = getattr(o, s_)
+                        except AttributeError:
+                            pass
             try:
-                d = vars(o)
+                d.update(vars(o))
             except TypeError:
-                slots = []
-                for c in t.__mro__:
-                    for s in getattr(c, "__slots__", ()) or ():
-                        if isinstance(s, str) and hasattr(o, s):
-                            slots.append((s, getattr(o, s)))
-                d = dict(slots)
+                pass
             return ("O", mod, t.__qualname__, tuple((k, self.key(v, depth + 1)) for k, v in sorted(d.items())
-                                                     if k not in ("parent", "_parent", "_hash")))
+                                                     if k not in ("parent", "_parent", "_hash", "arg_key", "index")))
         if mod in ("functools", "typing", "threading", "_thread", "logging", "weakref", "abc", "builtins", "types",
                    "collections", "itertools", "operator", "_functools", "_collections", "decimal", "datetime"):
             if mod in ("decimal", "datetime"):

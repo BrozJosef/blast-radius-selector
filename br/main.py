@@ -37,7 +37,7 @@ NONARROW = bool(os.environ.get("BR_NONARROW"))   # fingerprint may only prove "i
 FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
-B_AFTER_FAIL = float(os.environ.get("BR_B_AFTER_FAIL", "1.5"))
+MISS_COST = 1500.0   # ms of real executor runs allowed after memo misses (memo.MISS_BUDGET)
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
 HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
 INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
@@ -241,6 +241,7 @@ _ST = []
 
 
 _CK = []
+NORULES = bool(os.environ.get("BR_NORULES"))
 NOCK = not os.environ.get("BR_CK")   # entry-level table narrowing: off until its adversarial round is in
 
 
@@ -571,7 +572,14 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         if lvl and t.endswith("::test_execute_tpcds"):
             # measured share left once the executor stage is memoised; a change already seen to alter
             # behaviour mostly misses the plan-level memo and the mutated plans tend to run longer
-            c *= 0.14 if lvl == "A" else (B_AFTER_FAIL if seen_fail[0] else 0.62)
+            # shares measured in the image; runs after memo misses are capped by memo.MISS_BUDGET,
+            # so a change that alters many plans adds that cap, not a full run
+            if lvl == "A":
+                c *= 0.10
+            elif lvl[0] == "R":
+                c = c * 0.40 + MISS_COST if seen_fail[0] else c * (0.08 + 0.06 * (lvl.count(",") + 1))
+            else:
+                c = c * 0.40 + (MISS_COST if seen_fail[0] else 0.0)
         return c * CPU_SCALE
 
     # Readers of an edited data file nearly always fail. Unless slicing makes confirming them
@@ -701,8 +709,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     broke = dict(LAST_INFO.get("pool_broken") or {})
     # Second look: when everything cheap passed, the rest is far less likely to fail, so paying
     # CPU to clear it (instead of a worker's time) becomes worthwhile for more tests.
-    rest = [t for t in heavy if t not in sure]
     seen_fail[0] = bool(bad)
+    # best value first: CPU needed per second of worker time the test would otherwise occupy
+    rest = sorted((t for t in heavy if t not in sure), key=lambda t: cost(t) / max(1.0, secs_ms[num_of[t]] + 20.0))
     if rest and not broke and time.time() - T0 < WALL_BUDGET:
         # with failures already seen, an expensive candidate probably fails too: running it rarely pays
         k2 = choose(rest, list(sure) + [t for t in bad if t in num_of], P_FAIL2 if not bad else P_FAIL_AFTER,
@@ -781,6 +790,12 @@ def exec_memo_ok(plan, fx):
             return False
         if (st["A"].get(path) and (st["A"][path] & ls)) or path.startswith(("sqlglot/planner.py", "sqlglot/optimizer/")):
             level = "B"
+    if level == "B" and not NORULES:
+        # only code inside optimizer rules is touched: those rules alone need to run again
+        from . import rulememo
+        hit = rulememo.eligible(plan.lines, st)
+        if hit and len(hit) <= 4:      # beyond a few rules the reloads cost more than the plan-level memo
+            level = "R:" + ",".join(str(j) for j in sorted(hit))
     return level
 
 
