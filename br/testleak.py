@@ -207,6 +207,19 @@ def writes_shared_state(fn, outer=frozenset()):
             return True
     loc = (_locals_of(fn) | set(outer)) - {"cls"}
     loc.discard("self")
+    # a local that is merely another name for a class- or module-level object is not local state:
+    # `table = cls.TABLE` (no copying call) followed by `table[k] = v` writes the shared table
+    for _ in range(2):
+        for n in ast.walk(fn):
+            tgt = None
+            if isinstance(n, ast.Assign) and len(n.targets) == 1:
+                tgt = n.targets[0]
+            elif isinstance(n, ast.AnnAssign) and n.value is not None:
+                tgt = n.target
+            if isinstance(tgt, ast.Name) and isinstance(n.value, (ast.Attribute, ast.Subscript, ast.Name)):
+                root = _shared_root(n.value)
+                if root is not None and root != "self" and root not in loc:
+                    loc.discard(tgt.id)
 
     def shared(node):
         root = _shared_root(node)
