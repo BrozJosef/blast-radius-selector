@@ -1087,9 +1087,18 @@ def main():
         for c in DIAG_CPU:
             inc.append((c[0] - prev[0]) + (c[1] - prev[1]) + (c[2] - prev[2])); prev = c
         order = sorted(range(len(inc)), key=lambda i: -inc[i])
-        k = int(mode[1:]) if len(mode) > 1 else 0
-        i = order[k] if k < len(order) else 0
-        N = min(63, i) * 256 + min(255, int(round(inc[i] * 10)))
+        if mode == "C":
+            top = [min(31, int(round(inc[i] * 2))) for i in order[:3]] + [0, 0, 0]
+            N = top[0] * 1024 + top[1] * 32 + top[2]
+        elif mode == "D":
+            # how many commits burnt more than 1 s / 3 s, and the CPU of all the others together
+            big1 = sum(1 for x in inc if x > 1.0); big3 = sum(1 for x in inc if x > 3.0)
+            rest = sum(x for x in inc if x <= 1.0)
+            N = min(31, big1) * 1024 + min(31, big3) * 32 + min(31, int(round(rest)))
+        else:
+            k = int(mode[1:]) if len(mode) > 1 else 0
+            i = order[k] if k < len(order) else 0
+            N = min(63, i) * 256 + min(255, int(round(inc[i] * 10)))
     log("DIAG", mode, N, "ov %.2f zy %.2f self %.2f" % (ov_cpu, zy_cpu, self_cpu))
     done_diag = False
     for j, (cid, workers) in enumerate(DIAG_ROWS):
