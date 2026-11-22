@@ -9,7 +9,7 @@ RUN mkdir -p /app/src \
  && tar xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 \
  && rm /tmp/sqlglot.tar.gz \
  && python -m compileall -q /app/src/sqlglot /app/src/tests
-ENV PYTHONHASHSEED=0 BR_RADICAL=8
+ENV PYTHONHASHSEED=0 BR_DROP_UNRUN=1
 COPY br /app/br
 COPY maps /app/maps
 RUN python -m compileall -q /app/br \

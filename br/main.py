@@ -252,6 +252,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     return set(res["failing"])
 
 
+DROP_UNRUN = bool(os.environ.get("BR_DROP_UNRUN"))
 RADICAL = int(os.environ.get("BR_RADICAL", "0"))
 RADICAL_MS = int(os.environ.get("BR_RADICAL_MS", "1500"))
 _OV = {}   # the patched-tree child that serves the commit being decided
@@ -1046,6 +1047,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     if lost:
         log(cid, "bookkeeping lost %d candidates: included" % len(lost))
         heavy = list(heavy) + lost
+    if DROP_UNRUN:
+        # only what was seen failing, plus readers of edited data files
+        return sorted({num_of[t] for t in bad if t in num_of} | set(incl(sorted(sure)))), plan
     return sorted(set(incl(heavy)) | {num_of[t] for t in bad if t in num_of} | set(extra)), plan
 
 
