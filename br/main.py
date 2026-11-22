@@ -697,8 +697,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     cheap_order = [t for t in order if cost(t) <= HEAVY_MS]
     dear = [t for t in order if cost(t) > HEAVY_MS]
     k = choose(cheap_order, list(sure) + dear, P_FAIL, ()) if cheap_order else 0
-    if k == 0 and dear and cheap_order:
-        # cheap candidates are worth running for what they tell us about the expensive ones
+    if k == 0 and dear and cheap_order and choose(dear, list(sure), P_FAIL2, {t.rsplit("::", 1)[0] for t in cheap_order}) > 0:
+        # cheap candidates are worth running for what they tell us about the expensive ones, but
+        # only when a clean result would actually get an expensive one run afterwards
         acc = 0.0
         for t in cheap_order:
             acc += cost(t)
@@ -757,7 +758,16 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 log(cid, "hot error", repr(e))
                 bad = None
         if bad is None:
-            bad = execute(cid, plan, ts, limits, timeout, allow, mini=mini)
+            # A patched-tree child has no executor memo: the big executor test would run at full
+            # length there. Leave it out of the batch and count it as failing (it gets included).
+            dropped = [t for t in ts if lvl and t.endswith("::test_execute_tpcds")]
+            ts2 = [t for t in ts if t not in dropped]
+            if dropped and not ts2:
+                LAST_INFO.clear()
+                return set(dropped)
+            bad = execute(cid, plan, ts2, limits, timeout, allow, mini=mini)
+            if dropped and isinstance(bad, set):
+                bad = set(bad) | set(dropped)
         return bad
 
     timeouts = [0]
