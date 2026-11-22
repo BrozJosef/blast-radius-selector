@@ -6,6 +6,7 @@ import unittest
 
 
 FAIL_FAST = True
+MAX_TIMEOUTS = 2
 
 
 class _Abort(Exception):
@@ -25,6 +26,21 @@ class _Result(unittest.TestResult):
         self.bad = set()       # test ids (unittest id form) that failed
         self.bad_classes = set()
         self.pool_broke_at = None
+        self.limits = {}
+        self.default_limit = 30.0
+        self.setup_limit = 30.0
+        self.timeouts = 0
+
+    def addError(self, test, err):
+        if err and err[0] is Timeout:
+            self.timeouts += 1
+            if self.timeouts >= MAX_TIMEOUTS:
+                self.shouldStop = True   # a hanging mutant: do not burn the budget on every remaining test
+        super().addError(test, err)
+        self._mark(test)
+
+    def _unused(self):
+        pass
 
     def _mark(self, test):
         tid = getattr(test, "test_case", test)  # subtests point at their parent
@@ -35,10 +51,6 @@ class _Result(unittest.TestResult):
             d = getattr(tid, "description", str(tid))
             self.bad_classes.add(d)
 
-    def addError(self, test, err):
-        super().addError(test, err)
-        self._mark(test)
-
     def addFailure(self, test, err):
         super().addFailure(test, err)
         self._mark(test)
@@ -47,10 +59,20 @@ class _Result(unittest.TestResult):
         super().addSubTest(test, subtest, err)
         if err is not None:
             self.bad.add(test.id())
+            if err[0] is Timeout:
+                self.timeouts += 1
+                if self.timeouts >= MAX_TIMEOUTS:
+                    self.shouldStop = True
             if FAIL_FAST:
                 raise _Abort()  # verdict is known; skip the rest of this test
 
+    def startTest(self, test):
+        super().startTest(test)
+        lim = self.limits.get(test.id(), self.default_limit)
+        signal.setitimer(signal.ITIMER_REAL, lim)
+
     def stopTest(self, test):
+        signal.setitimer(signal.ITIMER_REAL, self.setup_limit)   # covers class/module fixtures in between
         super().stopTest(test)
         # a class-wide pool that broke during this test takes every later pool user down with it
         if self.pool_broke_at is None:
@@ -91,7 +113,7 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-def run_ids(ids, limits=None, default_limit=60.0):
+def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
     """ids: 'tests/x.py::Class::method'. Returns (failing set, info dict)."""
     failing = set()
     info = {}
@@ -101,7 +123,12 @@ def run_ids(ids, limits=None, default_limit=60.0):
         f, c, m = tid.split("::")
         by_class.setdefault((f, c), []).append((m, tid))
     signal.signal(signal.SIGALRM, _alarm)
+    hung = False
     for (f, c), items in by_class.items():
+        if hung:
+            for m, tid in items:
+                failing.add(tid)
+            continue
         modname = f[:-3].replace("/", ".")
         try:
             mod = importlib.import_module(modname)
@@ -132,11 +159,15 @@ def run_ids(ids, limits=None, default_limit=60.0):
             continue
         res = _Result()
         suite = unittest.TestSuite(cases)
-        budget = sum((limits or {}).get(tid, default_limit) for _, tid in items) if limits else default_limit * len(items)
-        signal.setitimer(signal.ITIMER_REAL, max(2.0, budget), 5.0)
+        lim = limits or {}
+        res.limits = {case.id(): lim.get(idmap[case.id()], default_limit) for case in cases}
+        res.default_limit = default_limit
+        res.setup_limit = setup_limit
+        signal.setitimer(signal.ITIMER_REAL, setup_limit)
         try:
             suite.run(res)
         except Timeout:
+            # raised outside any test (class setup or teardown hung)
             for m, tid in items:
                 failing.add(tid)
             info[f + "::" + c] = "timeout"
@@ -150,6 +181,14 @@ def run_ids(ids, limits=None, default_limit=60.0):
             continue
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
+        if res.shouldStop:
+            # stopped after repeated timeouts: everything not run is assumed to hang too
+            done = {t.id() for t in cases[:res.testsRun]}
+            for case in cases:
+                if case.id() not in done:
+                    failing.add(idmap[case.id()])
+            info[f + "::" + c] = "stopped after %d timeouts" % res.timeouts
+            hung = True
         for uid in res.bad:
             if uid in idmap:
                 failing.add(idmap[uid])

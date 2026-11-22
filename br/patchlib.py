@@ -209,3 +209,25 @@ def changed_old_lines(fc):
             elif tag == "+":
                 inserts.append(o - 1)
     return removed, inserts
+
+
+def changed_ranges(fc):
+    """Tight line ranges touched by the hunks: (old ranges, new ranges), inclusive.
+    A pure insertion is reported on the old side as the two lines around it."""
+    olds, news = [], []
+    for os_, ol, ns, nl, body in fc.hunks:
+        o = os_ if ol > 0 else os_ + 1
+        n = ns if nl > 0 else ns + 1
+        for tag, txt in body:
+            if tag == " ":
+                o += 1
+                n += 1
+            elif tag == "-":
+                olds.append((o, o))
+                news.append((n - 1, n))
+                o += 1
+            elif tag == "+":
+                news.append((n, n))
+                olds.append((o - 1, o))
+                n += 1
+    return olds, news

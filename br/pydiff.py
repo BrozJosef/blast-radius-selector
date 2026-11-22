@@ -118,7 +118,8 @@ def op_sites(a, b):
                 and [_dump(v) for v in x.values] == [_dump(v) for v in y.values]:
             sites.append((x.lineno, x.col_offset, "bool", "and" if isinstance(x.op, ast.And) else "or",
                           "and" if isinstance(y.op, ast.And) else "or", 2))
-        elif isinstance(x, ast.BoolOp):
+        elif isinstance(x, ast.BoolOp) and isinstance(y, ast.BoolOp) and not any(
+                isinstance(z, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda)) for z in ast.walk(y)):
             # reshaped boolean chain: anything that evaluates the old expression may differ
             sites.append((x.lineno, x.col_offset, "bool", None, None, len(x.values)))
         else:
@@ -189,12 +190,36 @@ def _is_doc(stmt):
     return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
 
 
+def _hit(node, ranges):
+    a, b = _span(node)
+    for x, y in ranges:
+        if x <= b and y >= a:
+            return True
+    return False
+
+
 class _Differ:
-    def __init__(self):
+    def __init__(self, ranges=None):
         self.md = ModDiff()
+        self.ranges = ranges
+
+    def _aligned(self, old, new):
+        """Same statement skeleton on both sides, so untouched statements can be skipped."""
+        if self.ranges is None or len(old) != len(new):
+            return False
+        for a, b in zip(old, new):
+            if type(a) is not type(b) or getattr(a, "name", None) != getattr(b, "name", None):
+                return False
+        return True
 
     # ---------- import-time scopes (module / class bodies) ----------
     def body_import(self, old, new, scope):
+        if self._aligned(old, new):
+            ro, rn = self.ranges
+            for a, b in zip(old, new):
+                if _hit(a, ro) or _hit(b, rn):
+                    self.stmt_import(a, b, scope)
+            return
         do = [_dump(s) for s in old]
         dn = [_dump(s) for s in new]
         if do == dn:
@@ -276,7 +301,7 @@ class _Differ:
                 return
         na, nb = _targets(a), _targets(b)
         names = None if na is None or nb is None else (na | nb)
-        self.md.imports.append(ImportChange(scope, names, _span(a), "changed " + type(a).__name__))
+        self.md.imports.append(ImportChange(scope, names, _span(a), ("changed " if na == nb else "renamed ") + type(a).__name__))
 
     def _headers_equal(self, a, b):
         if isinstance(a, ast.If) or isinstance(a, ast.While):
@@ -387,8 +412,9 @@ class _Differ:
             fc.other = True
 
 
-def diff_module(old_src, new_src):
-    d = _Differ()
+def diff_module(old_src, new_src, ranges=None):
+    """ranges: (old line ranges, new line ranges) the patch touched; lets untouched statements be skipped."""
+    d = _Differ(ranges)
     md = d.md
     try:
         to = ast.parse(old_src)
@@ -403,6 +429,12 @@ def diff_module(old_src, new_src):
     if to is None:
         md.imports.append(ImportChange("", None, None, "old unparsable"))
         return md
+    if ranges is not None and d._aligned(to.body, tn.body):
+        d.body_import(to.body, tn.body, "")
+        if not md.funcs and not md.imports:
+            md.same = True
+        return md
+    d.ranges = None
     if _dump(to) == _dump(tn):
         md.same = True
         return md

@@ -7,6 +7,7 @@ gives the same verdict as the whole test at a fraction of the cost.
 import sys
 
 ALLOW = {}      # loader filename -> set of entry indices (absent = everything)
+OVERRIDE = {}   # loader filename -> alternative fixtures directory holding a patched copy
 SEEN = {}       # loader filename -> number of entries yielded by the unsliced loader (for discovery)
 _orig = {}
 
@@ -15,7 +16,11 @@ def _wrap(name, fn):
     def wrapped(filename, *a, **k):
         allow = ALLOW.get(filename)
         n = 0
-        for i, item in enumerate(fn(filename, *a, **k)):
+        if filename in OVERRIDE and not a and not k:
+            src = entries(filename, name, OVERRIDE[filename])
+        else:
+            src = fn(filename, *a, **k)
+        for i, item in enumerate(src):
             n = i + 1
             if allow is None or i in allow:
                 yield item

@@ -30,8 +30,17 @@ class InlineExecutor:
             if not self._inited:
                 self._inited = True
                 if self._init[0]:
-                    # initargs are plain data tables; pickling them is costly and changes nothing
-                    self._init[0](*self._init[1])
+                    # a spawned worker receives the initializer and its arguments through pickle
+                    blob = pickle.dumps(self._init)
+                    try:
+                        ifn, iargs = pickle.loads(blob)
+                    except BaseException as e:
+                        if type(e).__name__ == "Timeout":
+                            raise
+                        self._broken = True
+                        BROKEN.append(self)
+                        return self._broken_future()
+                    ifn(*iargs)
             data = pickle.dumps((fn, args, kwargs))
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)) or type(e).__name__ == "Timeout":

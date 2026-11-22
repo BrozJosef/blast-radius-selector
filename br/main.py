@@ -20,11 +20,12 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 DEBUG = os.environ.get("BR_DEBUG")
 
 # policy knobs
-RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "4000"))    # never execute a test slower than this
-RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "12000"))
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))   # offline CPU map -> expected CPU on the scorer
-P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))  # nor a batch bigger than this
-WALL_BUDGET = float(os.environ.get("BR_WALL", "150"))                  # stop executing after this many seconds
+RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "20000"))    # never execute a test slower than this
+RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "30000"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "3.0"))   # offline CPU map -> expected CPU on the scorer
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))  # nor a batch bigger than this
+WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))                  # stop executing after this many seconds
+WALL_HARD = float(os.environ.get("BR_WALL_HARD", "165"))               # no child may run past this
 NOEXEC = bool(os.environ.get("BR_NOEXEC"))
 HOT = not os.environ.get("BR_NOHOT")
 NOSLICE = bool(os.environ.get("BR_NOSLICE"))
@@ -35,6 +36,7 @@ _ZY = []
 
 def zygote():
     if not _ZY:
+        preimport(["tests/test_optimizer.py"])   # so the zygote inherits the heavy third-party imports
         _ZY.append(hot.Zygote(SRC, debug=bool(DEBUG)))
     return _ZY[0]
 
@@ -182,7 +184,10 @@ def slicemap():
         import zlib
         try:
             with open(os.path.join(os.path.dirname(MAPS), "slices.bin"), "rb") as f:
-                _SL.append(pickle.loads(zlib.decompress(f.read())))
+                d = pickle.load(f)
+            d["_blobs"] = d["lines"]
+            d["lines"] = select._PerKey(d["_blobs"])
+            _SL.append(d)
         except Exception as e:
             log("no slice map", repr(e))
             _SL.append({"tests": {}, "lines": {}, "singles": set()})
@@ -190,12 +195,51 @@ def slicemap():
 
 
 FIX = "tests/fixtures/"
+_SV = []
+
+
+def slice_vp(plan, t, M):
+    """Entries of a fixture-driven test in which the swapped operator(s) can yield a different value.
+    Returns (whole, {fixture: bitmask}) or None when value profiles cannot decide."""
+    if not plan.sites_only or not plan.sites:
+        return None
+    if not _SV:
+        import pickle
+        try:
+            with open(os.path.join(os.path.dirname(MAPS), "slicevp.bin"), "rb") as f:
+                _SV.append(select._PerKey(pickle.load(f)))
+        except Exception as e:
+            log("no slice value profiles", repr(e))
+            _SV.append(None)
+    sv = _SV[0]
+    if sv is None:
+        return None
+    rec = sv.get(t)
+    if rec is None:
+        return None
+    mine = {}
+    for path, sites in plan.sites.items():
+        for site in sites:
+            sp = select.site_pred(M, path, site)
+            if sp is None:
+                return None
+            sid, which, differs = sp
+            for m in rec["resid"][which].get(sid, ()):
+                if differs(m):
+                    return True, {}
+            for F, fr in rec["files"].items():
+                for m, mask in fr[which].get(sid, {}).items():
+                    if differs(m):
+                        mine[F] = mine.get(F, 0) | mask
+    return False, mine
 
 
 def plan_slices(plan, cand_ids, M):
     """Which fixture entries each fixture-driven candidate needs. Returns (allow, est_cpu_ms per test)."""
     if NOSLICE or plan.renames or any(p.startswith("tests/") and p.endswith(".py") for p in plan.files):
         return {}, {}
+    if any(not (p.startswith(FIX) and p.endswith(".sql")) for p in plan.data_files):
+        return {}, {}   # some other data file changed: nothing tells us which entries read it
     S = slicemap()
     need = {}      # fixture name -> set of entries, or None for everything
     est = {}
@@ -215,7 +259,12 @@ def plan_slices(plan, cand_ids, M):
             continue
         mine = {}
         whole = False
-        if plan.lines:
+        vp = slice_vp(plan, t, M) if (code and plan.lines) else None
+        if vp is not None:
+            whole, mine = vp
+            if not whole and not mine and M.idx[t] not in plan.data_cands:
+                whole = True
+        elif plan.lines:
             if not code:
                 whole = True
             else:
@@ -224,10 +273,20 @@ def plan_slices(plan, cand_ids, M):
                         whole = True
                         break
                     d = S["lines"].get(path, {})
+                    cov = M.lines.get(path) or {}
+                    ti = M.idx[t]
                     for l in ls:
+                        hit = False
                         for (tid, F, mask) in d.get(l, ()):
                             if tid == t:
                                 mine[F] = mine.get(F, 0) | mask
+                                hit = True
+                        if not hit:
+                            b = cov.get(l)
+                            if b and ti in M.un(b):
+                                whole = True   # the test runs this line but no single entry accounts for it
+                    if whole:
+                        break
                 if not whole and not mine and M.idx[t] not in plan.data_cands:
                     whole = True   # coverage says it is a candidate but no entry explains why
         elif not plan.data_files:
@@ -288,7 +347,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         return sorted(set(fallback) | set(cascade(cand_ids, M, num_of))), plan
     if not cand_ids:
         if plan.import_probe:
-            r = execute(cid, plan, [], {}, 20.0)
+            r = execute(cid, plan, [], {}, 12.0)
             if r is None or r == "BROKEN":
                 log(cid, "import broken -> broad", len(broad))
                 return broad, plan
@@ -296,10 +355,14 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     allow, sl_est = plan_slices(plan, cand_ids, M)
     cpu = M.cpu
 
+    lvl = exec_memo_ok(plan, None) if HOT else False
+
     def cost(t):
         c = sl_est.get(t)
         if c is None:
             c = cpu.get(t, secs_ms[num_of[t]])
+        if lvl and t.endswith("::test_execute_tpcds"):
+            c *= 0.14 if lvl == "A" else 0.62   # measured share left once the executor stage is memoised
         return c * CPU_SCALE
 
     # Readers of an edited data file nearly always fail. Unless slicing makes confirming them
@@ -315,7 +378,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         return packer.pack(set(incl(ts)) | set(cascade(ts, M, num_of)), secs_ms)[1]
 
     def choose(order, fixed, p_fail, spent_classes):
-        best = (blind(list(order) + list(fixed)), 0)
+        full = blind(list(order) + list(fixed))
+        best = (full, 0)
         run_ms = 60.0
         classes = set(spent_classes)
         for k, t in enumerate(order, 1):
@@ -330,7 +394,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             if run_ms > RUN_MAX_TOTAL_MS:
                 break
             rest = list(order[k:]) + list(fixed)
-            est = run_ms + (blind(rest) if rest else p_fail * 2100)
+            br = blind(rest) if rest else 0
+            # what we run still fails with probability p_fail, and then costs what it would have blind
+            est = run_ms + br + p_fail * (full - br)
             if est <= best[0]:
                 best = (est, k)
         return best[1]
@@ -341,20 +407,24 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         log(cid, "PLAN run", [(t.split("::")[-1], round(cost(t))) for t in light][:6], "incl", [(t.split("::")[-1], round(cost(t)), secs_ms[num_of[t]]) for t in heavy][:6], "allow", {k_: len(v) for k_, v in allow.items()})
     if not light:
         if plan.import_probe:
-            r = execute(cid, plan, [], {}, 20.0)
+            r = execute(cid, plan, [], {}, 12.0)
             if r is None or r == "BROKEN":
                 return broad, plan
         return sorted(set(incl(cand_ids)) | set(cascade(cand_ids, M, num_of))), plan
 
     def run(ts):
         total = sum(cost(t) for t in ts)
-        limits = {t: max(15.0, 20 * max(cpu.get(t, 0), secs_ms[num_of[t]]) / 1000.0) for t in ts}
-        timeout = max(30.0, 8 * total / 1000.0 + 20.0)
+        # a test gets several times its expected CPU before it counts as hung
+        limits = {t: max(8.0, 0.012 * max(cpu.get(t, 0), secs_ms[num_of[t]] * 0.3)) for t in ts}
+        timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(25.0, 0.012 * total + 15.0))
         bad = None
-        if HOT and hot.eligible(plan):
+        fx = fixture_only(plan, ts, allow)
+        if HOT and (fx is not None or hot.eligible(plan)):
             try:
-                files = {f: plan.files[f] for f in {f for f, _ in plan.hot}}
-                bad, why = zygote().run(cid, files, ts, limits, timeout, allow=allow)
+                preimport(ts)
+                files = {} if fx is not None else {f: plan.files[f] for f in {f for f, _ in plan.hot}}
+                bad, why = zygote().run(cid, files, ts, limits, timeout, allow=allow, override=fx,
+                                        opts={"exec_memo": exec_memo_ok(plan, fx)})
                 LAST_INFO.clear()
                 LAST_INFO.update(getattr(zygote(), "last_info", None) or {})
                 if bad is None:
@@ -395,6 +465,54 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         extra += [num_of[t] for t in M.pool_users.get(cl, ()) if t in num_of and t.rsplit("::", 1)[-1] >= first]
         log(cid, "pool broke in", cl, "at", first)
     return sorted(set(incl(heavy)) | {num_of[t] for t in bad if t in num_of} | set(extra)), plan
+
+
+_STAGE = []
+
+
+def exec_memo_ok(plan, fx):
+    """Which executor memo level is valid: "A" (whole query) when no changed line runs inside
+    sqlglot.executor.execute, "B" (plan execution) when none runs inside PythonExecutor.execute."""
+    if fx is not None:
+        return False         # fixture text changed: queries differ; let them run
+    if not hot.eligible(plan) or not plan.lines_ok:
+        return False
+    if not _STAGE:
+        import pickle
+        try:
+            with open(os.path.join(os.path.dirname(MAPS), "exec_stage.pkl"), "rb") as f:
+                _STAGE.append(pickle.load(f))
+        except Exception:
+            _STAGE.append(None)
+    st = _STAGE[0]
+    if st is None:
+        return False
+    level = "A"
+    for path, ls in plan.lines.items():
+        if path.startswith("tests/"):
+            return False
+        if st["B"].get(path) and (st["B"][path] & ls):
+            return False
+        if path.startswith("sqlglot/executor/"):
+            return False
+        if (st["A"].get(path) and (st["A"][path] & ls)) or path.startswith(("sqlglot/planner.py", "sqlglot/optimizer/")):
+            level = "B"
+    return level
+
+
+def fixture_only(plan, ts, allow):
+    """Patched .sql fixtures that only loader-driven tests read can be served from the warm zygote."""
+    if not plan.data_files or len(plan.data_files) != len(plan.files) or plan.renames or plan.import_probe:
+        return None
+    S = slicemap()
+    out = {}
+    for path, (old, new) in plan.data_files.items():
+        if not (path.startswith(FIX) and path.endswith(".sql")) or new is None:
+            return None
+        out[path[len(FIX):]] = new
+    if any(t not in S["tests"] for t in ts):
+        return None
+    return out
 
 
 def cascade(not_run, M, num_of):

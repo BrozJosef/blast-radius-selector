@@ -309,7 +309,7 @@ class _Server:
             code = 1
             try:
                 os.close(r)
-                res = self.grandchild(files, olds, ids, job.get("limits"), before, job.get("allow"))
+                res = self.grandchild(files, olds, ids, job.get("limits"), before, job.get("allow"), job.get("override"), job.get("opts"))
                 _send(w, res)
                 code = 0
             except Cannot as e:
@@ -347,12 +347,23 @@ class _Server:
                     pass
         return res
 
-    def grandchild(self, files, olds, ids, limits, before, allow=None):
+    def grandchild(self, files, olds, ids, limits, before, allow=None, override=None, opts=None):
         npatched = 0
-        if allow:
+        if opts and opts.get("exec_memo"):
+            from . import memo
+            memo.EXEC_OK = opts["exec_memo"]
+        if allow or override:
             from . import slices
             slices.ALLOW.clear()
-            slices.ALLOW.update({k: set(v) for k, v in allow.items()})
+            slices.ALLOW.update({k: set(v) for k, v in (allow or {}).items()})
+            if override:
+                d = os.path.join(os.environ.get("BR_TMP", "/tmp"), "fx_%d" % os.getpid())
+                for name, text in override.items():
+                    path = os.path.join(d, name)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8", newline="") as f:
+                        f.write(text)
+                    slices.OVERRIDE[name] = d
             slices.install()
         for rel, text in files.items():
             path = os.path.join(self.src, rel)
@@ -376,6 +387,7 @@ class _Server:
                 f.__code__ = n
                 npatched += 1
         from . import runner
+        runner.MEMO_OK = not any(p.startswith("tests/") for p in files)
         bad, info = runner.run_ids(ids, limits)
         newmods = [m for m in sys.modules if m not in before and m.startswith(("sqlglot", "tests"))]
         return {"failing": sorted(bad), "info": info, "newmods": newmods, "patched": npatched}
@@ -441,7 +453,7 @@ class Zygote:
     def total_cpu(self):
         return self.cpu_dead + self.cpu
 
-    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None):
+    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None, override=None, opts=None):
         """files: {relpath: full new source}. Returns (failing set | None, reason)."""
         if self.pid is None:
             try:
@@ -450,7 +462,7 @@ class Zygote:
                 return None, "cannot start zygote: %r" % (e,)
         try:
             _send(self.w, {"cid": cid, "files": files, "ids": list(ids), "limits": limits, "timeout": timeout,
-                           "allow": {k: sorted(v) for k, v in (allow or {}).items()}})
+                           "allow": {k: sorted(v) for k, v in (allow or {}).items()}, "override": override or {}, "opts": opts or {}})
         except OSError as e:
             self.stop()
             return None, "zygote gone: %r" % (e,)

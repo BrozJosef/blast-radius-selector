@@ -9,13 +9,47 @@ from . import patchlib, pydiff
 SRC = os.environ.get("BR_SRC", "/app/src")
 USE_VP = not os.environ.get("BR_NOVP")
 VP_INTERSECT = False
-PYTEST_CFG = ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".pytest.ini")
+PYTEST_CFG = ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", ".pytest.ini", "pytest.toml", ".pytest.toml")
+INERT_DIRS = ("benchmarks", "pdoc", "posts", "sqlglotc", ".github", "sqlglot-integration-tests")
+
+
+class _PerKey:
+    """dict of zlib+pickle blobs, decoded on first access."""
+
+    def __init__(self, blobs):
+        self._b = blobs
+        self._d = {}
+
+    def get(self, k, default=None):
+        v = self._d.get(k, self)
+        if v is self:
+            b = self._b.get(k)
+            v = self._d[k] = pickle.loads(zlib.decompress(b)) if b is not None else None
+        return default if v is None else v
+
+    def __contains__(self, k):
+        return k in self._b
+
+    def __getitem__(self, k):
+        v = self.get(k)
+        if v is None:
+            raise KeyError(k)
+        return v
+
+    def __iter__(self):
+        return iter(self._b)
+
+    def keys(self):
+        return self._b.keys()
 
 
 class Maps:
     def __init__(self, path):
         with open(path, "rb") as f:
-            d = pickle.loads(zlib.decompress(f.read()))
+            d = pickle.load(f)
+        self._lazy = {k: d.pop(k) for k in d.pop("__lazy__")}
+        for k in d.pop("__perkey__"):
+            d[k] = _PerKey(d[k])
         self.__dict__.update(d)
         self.n = len(self.tests)
         self.idx = {t: i for i, t in enumerate(self.tests)}
@@ -25,6 +59,14 @@ class Maps:
         self._mod_users = {}
         self._importers = None
         self._cls_by_file = None
+
+    def __getattr__(self, name):
+        lz = self.__dict__.get("_lazy")
+        if lz is not None and name in lz:
+            v = pickle.loads(zlib.decompress(lz.pop(name)))
+            self.__dict__[name] = v
+            return v
+        raise AttributeError(name)
 
     @staticmethod
     def un(b):
@@ -126,15 +168,20 @@ class Maps:
             out |= self.users_module(g)
         return out
 
-    def is_deferred(self, f, line):
-        for sp in self.deferred.get(f, ()):
-            if sp[0] <= line <= sp[1]:
+    def is_deferred(self, f, line, col=None):
+        """Is this position inside a function or lambda body (code that runs when called)?"""
+        for l1, c1, l2, c2 in self.deferred.get(f, ()):
+            if col is None:
+                if l1 < line < l2 or (l1 == l2 == line):
+                    return True
+                continue
+            if (line, col) >= (l1, c1) and (line, col) < (l2, c2):
                 return True
         return False
 
-    def import_time_line(self, f, line):
-        """True when the line runs (or may run) while modules are being imported."""
-        if not self.is_deferred(f, line):
+    def import_time_line(self, f, line, col=None):
+        """True when the position runs (or may run) while modules are being imported."""
+        if not self.is_deferred(f, line, col):
             return True
         d = self.imp.get(f)
         return bool(d and line in d)
@@ -166,8 +213,8 @@ def _cmp_val(op, m):
     return (not v) if neg else bool(v)
 
 
-def infected(M, path, site, has_order_bits=None):
-    """Tests in which swapping the operator at `site` can change the value there; None = unknown."""
+def site_pred(M, path, site):
+    """For an operator swap at `site`: (sid, kind, differs(mask) -> bool), or None when unknown."""
     line, col, kind, old, new, n = site
     info = M.vsite.get(path, {}).get((line, col))
     if info is None:
@@ -175,36 +222,38 @@ def infected(M, path, site, has_order_bits=None):
     sid, skind, sop, sn, boolctx, pure = info
     if skind != kind or (old is not None and sop != old):
         return None
-    out = set()
     if kind == "cmp":
         if new is None or old is None:
             return None
-        recs = M.vc.get(sid, {})
         order_site = sop in _ORDER
-        for m, tb in recs.items():
+
+        def differs(m):
             if (new in _ORDER) and not order_site:
-                diff = True   # ordering was never recorded at an equality site
-            else:
-                a, b = _cmp_val(old, m), _cmp_val(new, m)
-                diff = a is None or b is None or a != b
-            if diff:
-                out.update(M.un(tb))
-        return out
-    recs = M.vb.get(sid, {})
+                return True   # ordering was never recorded at an equality site
+            a, b = _cmp_val(old, m), _cmp_val(new, m)
+            return a is None or b is None or a != b
+        return sid, "c", differs
     if old is None or new is None or n != 2 or sn != 2 or not boolctx or not pure:
-        for m, tb in recs.items():
-            out.update(M.un(tb))   # any evaluation of the expression
-        return out
-    # two operands, used only for truth: `a and b` vs `a or b`
-    for m, tb in recs.items():
+        return sid, "b", (lambda m: True)   # any evaluation of the expression
+
+    def differs_b(m):
         i, t = divmod(m, 3)
         if t == 2:
-            bad = True
-        elif old == "and":   # differs when a is falsy (b unknown) or b is falsy
-            bad = t == 0
-        else:                # `or` -> `and`: differs when a is truthy (b unknown) or b is truthy
-            bad = t == 1
-        if bad:
+            return True
+        # `a and b` -> `a or b` differs when a is falsy (b unknown) or b is falsy; mirrored for `or`
+        return t == 0 if old == "and" else t == 1
+    return sid, "b", differs_b
+
+
+def infected(M, path, site):
+    """Tests in which swapping the operator at `site` can change the value there; None = unknown."""
+    sp = site_pred(M, path, site)
+    if sp is None:
+        return None
+    sid, which, differs = sp
+    out = set()
+    for m, tb in (M.vc if which == "c" else M.vb).get(sid, {}).items():
+        if differs(m):
             out.update(M.un(tb))
     return out
 
@@ -222,6 +271,8 @@ class Plan:
         self.import_probe = set()  # modules whose import may now raise
         self.broad = set()         # what fails if such an import does raise
         self.broad_all = False
+        self.sites = {}            # path -> operator-swap sites, when every in-function change is one
+        self.sites_only = True
         self.lines = {}            # path -> old lines touched by in-function changes
         self.lines_ok = True       # False when some change is not captured by `lines`
         self.data_files = {}       # changed data file -> (old text, new text)
@@ -346,7 +397,7 @@ def _file(fc, M, plan):
         return
     plan.files[path] = content
     if path.endswith(".py"):
-        _python(path, src, content, M, plan)
+        _python(path, src, content, M, plan, patchlib.changed_ranges(fc))
     else:
         plan.data_files[path] = (src, content)
         _data(path, M, plan)
@@ -362,50 +413,52 @@ def _data(path, M, plan):
         # read while collecting / configuring: effect unknown
         plan.overlay = True
         if base in PYTEST_CFG and (path.count("/") == 0 or path.startswith("tests/")):
-            plan.all = True
-            plan.why("%s: pytest configuration" % path)
+            old, new = plan.data_files.get(path, (None, None))
+            if base in ("setup.cfg", "pyproject.toml", "tox.ini") and old is not None and new is not None \
+                    and "pytest" not in old.lower() and "pytest" not in new.lower():
+                plan.why("%s: configuration without any pytest section" % path)
+            else:
+                plan.all = True
+                plan.why("%s: pytest configuration" % path)
 
 
 def _added(path, M, plan, content):
     base = os.path.basename(path)
-    if base in PYTEST_CFG and (path.count("/") == 0 or path.startswith("tests/")):
+    top = path.split("/")[0]
+    if base in PYTEST_CFG and (path.count("/") == 0 or top == "tests"):
         plan.all = True
         plan.why("%s: new pytest configuration" % path)
         return
-    if path.endswith((".py", ".pth")) or "/" not in path and "." not in base:
-        top = path.split("/")[0]
-        if "/" not in path and path.endswith(".py"):
-            plan.all = True  # a root-level module can shadow any import
-            plan.why("%s: new root module" % path)
+    is_py = path.endswith((".py", ".pth", ".so", ".pyd"))
+    if is_py and top not in ("sqlglot", "tests") and top not in INERT_DIRS:
+        plan.all = True  # a new root module or package can shadow any import (duckdb/, pandas/, json.py ...)
+        plan.why("%s: new importable code outside the packages" % path)
+        return
+    if is_py and top in ("sqlglot", "tests"):
+        d = os.path.dirname(path)
+        stem = base[:-3] if base.endswith(".py") else base
+        if exists(os.path.join(d, stem)) or exists(os.path.join(d, stem + ".py")):
+            plan.all = True
+            plan.why("%s: shadows existing module" % path)
             return
-        if top in ("sqlglot", "tests"):
-            d = os.path.dirname(path)
-            stem = base[:-3] if base.endswith(".py") else base
-            # shadows an existing package/module of the same name?
-            if exists(os.path.join(d, stem)) or exists(os.path.join(d, stem + ".py")):
-                plan.all = True
-                plan.why("%s: shadows existing module" % path)
-                return
-            if base == "__init__.py" or base == "conftest.py":
-                plan.all = True
-                plan.why("%s: new package init" % path)
-                return
-            if top == "sqlglot":
-                # picked up by anything that walks the package (plugins/entry points do not)
-                plan.why("%s: new unimported module" % path)
-                return
-            plan.why("%s: new test-side module" % path)
+        if base in ("__init__.py", "conftest.py", "__main__.py") or not exists(os.path.join(d, "__init__.py")):
+            plan.all = True
+            plan.why("%s: new package init / namespace" % path)
             return
-    # a new data file: only matters if something globs its directory
+    # tests that read every file of this directory (package walkers, glob loaders) will see the new one
     d = os.path.dirname(path)
-    sib = [f for f in M.files if os.path.dirname(f) == d]
-    r = set()
-    for f in sib:
-        r |= M.readers(f)
-    if r and path.startswith("tests/fixtures"):
-        plan.why("%s: new file beside read files (%d sibling readers, ignored)" % (path, len(r)))
-    else:
-        plan.why("%s: new file" % path)
+    sib = [f for f in M.files if os.path.dirname(f) == d and f != path]
+    if sib:
+        walkers = None
+        for f in sib:
+            r = M.readers(f)
+            walkers = r if walkers is None else (walkers & r)
+        if walkers and len(sib) >= 2:
+            plan.cands |= walkers
+            plan.overlay = True
+            plan.why("%s: new file in a directory %d tests read in full" % (path, len(walkers)))
+            return
+    plan.why("%s: new file, nothing reads its directory" % path)
 
 
 def _removed(path, M, plan, why):
@@ -429,14 +482,24 @@ def _eager(path, M):
     return path in M.eager
 
 
-def _python(path, old, new, M, plan):
-    md = pydiff.diff_module(old, new)
+def _python(path, old, new, M, plan, ranges=None):
+    md = pydiff.diff_module(old, new, ranges)
     in_tests = path.startswith("tests/")
     known = path in M.lines or path in M.imp or path in M.imports or in_tests
     if md.same:
         r = M.readers(path)
         plan.cands |= r
         plan.why("%s: AST-identical -> %d source readers" % (path, len(r)))
+        if old.split("\n", 2)[:2] != new.split("\n", 2)[:2] or old[:1] == "\ufeff" or new[:1] == "\ufeff":
+            # an encoding declaration lives in the first two lines; the interpreter decodes bytes with it
+            plan.overlay = True
+            plan.import_probe.add(path)
+            plan.broad |= M.dependents(path, transitive=True)
+            if path in M.eager or in_tests:
+                plan.broad_all = True
+            plan.why("%s: first lines changed (encoding declaration?) -> import probe" % path)
+        if r:
+            plan.overlay = True
         return
     if md.syntax_error:
         if is_test_module(path):
@@ -453,6 +516,11 @@ def _python(path, old, new, M, plan):
         plan.overlay = True
         plan.why("%s: python outside packages -> %d readers" % (path, len(r)))
         return
+    r = M.readers(path)
+    if r:
+        plan.cands |= r
+        plan.overlay = True
+        plan.why("%s: %d tests read this source file" % (path, len(r)))
     for fc in md.funcs:
         lines = set(range(fc.start, fc.end + 1)) if (fc.whole or fc.header or fc.doc_only) else set(fc.lines)
         c = M.cover(path, lines)
@@ -468,6 +536,11 @@ def _python(path, old, new, M, plan):
                 plan.why("%s:%s operator swap: %d of %d covering tests can see a different value" % (path, fc.qual, len(inf & c), len(c)))
                 inf |= set(M.un(M.vp_bad)) & c   # tests that could not be profiled
                 c = inf & c if VP_INTERSECT else inf
+                plan.sites.setdefault(path, []).extend(fc.sites)
+            else:
+                plan.sites_only = False
+        else:
+            plan.sites_only = False
         imp_mods = set()
         d = M.imp.get(path, {})
         span = range(fc.start, fc.end + 1)
@@ -530,14 +603,24 @@ def _import_change(path, ic, M, plan):
         return c
     restricted = set()
     unrestricted = False
+    seen_sites = 0
+    removed = ic.what.startswith(("removed", "added", "renamed"))
+    if removed:
+        # a name that appears or disappears can break whoever imports it by name
+        for g in M.importers(path, False):
+            plan.import_probe.add(g)
+            plan.broad |= M.dependents(g, transitive=True)
+            if g in M.eager:
+                plan.broad_all = True
     for nm in names:
         sites = M.name_sites(nm)
         own = 0
-        for (f, l) in sites:
+        for (f, l, col) in sites:
             if f == path and ic.lines and ic.lines[0] <= l <= ic.lines[1]:
                 own += 1
                 continue
-            if M.import_time_line(f, l):
+            seen_sites += 1
+            if M.import_time_line(f, l, col):
                 unrestricted = True
                 break
             restricted |= M.cover(f, (l,))
@@ -547,6 +630,13 @@ def _import_change(path, ic, M, plan):
         c = fam if fam is not None else broad
         plan.why("%s[%s]: %s %s import-time readers -> %d" % (path, ic.scope, ic.what, sorted(names), len(c)))
         return c
-    c = restricted & fam if fam is not None else restricted
-    plan.why("%s[%s]: %s %s runtime readers %d -> %d" % (path, ic.scope, ic.what, sorted(names), len(restricted), len(c)))
+    if not seen_sites:
+        # nobody names it statically: it is reached dynamically (getattr dispatch, dunder protocols)
+        c = fam if fam is not None else broad
+        plan.why("%s[%s]: %s %s no static readers -> %d" % (path, ic.scope, ic.what, sorted(names), len(c)))
+    else:
+        c = restricted & fam if fam is not None else restricted
+        plan.why("%s[%s]: %s %s runtime readers %d -> %d" % (path, ic.scope, ic.what, sorted(names), len(restricted), len(c)))
+    if ic.lines:
+        c = c | M.cover_span(path, ic.lines[0], ic.lines[1])   # whoever ran the old definition
     return c
