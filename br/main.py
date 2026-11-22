@@ -252,6 +252,8 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     return set(res["failing"])
 
 
+RADICAL = int(os.environ.get("BR_RADICAL", "0"))
+RADICAL_MS = int(os.environ.get("BR_RADICAL_MS", "1500"))
 _OV = {}   # the patched-tree child that serves the commit being decided
 PERSIST = not os.environ.get("BR_NOPERSIST")
 
@@ -874,7 +876,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         light, heavy = order[:k], order[k:] + sorted(sure)
     if DEBUG:
         log(cid, "PLAN run", [(t.split("::")[-1], round(cost(t))) for t in light][:6], "incl", [(t.split("::")[-1], round(cost(t)), secs_ms[num_of[t]]) for t in heavy][:6], "allow", {k_: len(v) for k_, v in allow.items()})
-    if not light:
+    if not light and not RADICAL:
         if plan.import_probe:
             r = execute(cid, plan, [], {}, 12.0)
             if r is None or r == "BROKEN":
@@ -931,6 +933,22 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 bad = set(bad) | set(dropped)
         return bad
 
+    if RADICAL:
+        # Ask only a handful of the cheapest candidates. Nothing fails: the edit is taken to be
+        # without effect. Something fails: every candidate that is cheap to include goes in, unrun.
+        pool_ = sorted((t for t in cand_ids if t not in sure and cost(t) <= HEAVY_MS), key=cost)
+        probe = pool_[:RADICAL]
+        bad = run(probe) if probe else set()
+        if bad == "BROKEN":
+            return broad, plan
+        if bad is None:
+            return sorted(set(fallback) | set(cascade(cand_ids, M, num_of))), plan
+        plan.executed = probe
+        plan.failed = bad
+        keep = set(sure) | set(bad)
+        if bad or not probe:
+            keep |= {t for t in cand_ids if secs_ms[num_of[t]] <= RADICAL_MS}
+        return sorted(set(incl(sorted(keep)))), plan
     timeouts = [0]
     probe_cut = False
     cut_rest = []
