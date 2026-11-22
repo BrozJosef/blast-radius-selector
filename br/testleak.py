@@ -162,6 +162,12 @@ def _locals_of(fn):
     for n in ast.walk(fn):
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
             names.add(n.id)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)                      # parameters of nested functions and lambdas
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            names.add(n.name)
         elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
             names.add(n.name)
         elif isinstance(n, ast.alias):
@@ -169,19 +175,41 @@ def _locals_of(fn):
     return names
 
 
-def writes_shared_state(fn):
+_UPPER = __import__("re").compile(r"^_?[A-Z][A-Z0-9_]*$")
+
+
+def _shared_root(node):
+    """Like _root_name, but `self.CONSTANT...` and `self.__class__...` name class-level state, and
+    `cast(T, x)` stands for x."""
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Call, ast.Starred)):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" \
+                and (_UPPER.match(node.attr) or node.attr == "__class__"):
+            return "<class>"
+        if isinstance(node, ast.Call):
+            f = node.func
+            if (isinstance(f, ast.Attribute) and f.attr == "cast" or isinstance(f, ast.Name) and f.id == "cast") \
+                    and len(node.args) == 2:
+                node = node.args[1]
+                continue
+            node = f
+            continue
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def writes_shared_state(fn, outer=frozenset()):
     """fn: ast.FunctionDef. True if its body can write a table that outlives the call and is not
-    reached through `self` or a local."""
+    reached through `self` or a local (its own or an enclosing function's)."""
     for d in fn.decorator_list:
         r = d.func if isinstance(d, ast.Call) else d
         nm = r.attr if isinstance(r, ast.Attribute) else getattr(r, "id", None)
         if nm in _CACHE_DECOS:
             return True
-    loc = _locals_of(fn) - {"cls"}
+    loc = (_locals_of(fn) | set(outer)) - {"cls"}
     loc.discard("self")
 
     def shared(node):
-        root = _root_name(node)
+        root = _shared_root(node)
         return root is not None and root != "self" and root not in loc
 
     for n in ast.walk(fn):
@@ -218,12 +246,16 @@ def changed_state_writers(old, new, ranges_old):
         for n in ast.walk(tb):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 new_by_name.setdefault(n.name, []).append(n)
-    for n in ast.walk(ta):
-        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        lo = min([n.lineno] + [d.lineno for d in n.decorator_list])
-        if not any(a <= n.end_lineno and b >= lo for a, b in ranges_old):
-            continue
-        if writes_shared_state(n) or any(writes_shared_state(m) for m in new_by_name.get(n.name, ())):
-            out.append(n.name)
+    def visit(node, outer):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                lo = min([ch.lineno] + [d.lineno for d in ch.decorator_list])
+                if any(a <= ch.end_lineno and b >= lo for a, b in ranges_old):
+                    if writes_shared_state(ch, outer) or any(writes_shared_state(m, outer) for m in new_by_name.get(ch.name, ())):
+                        out.append(ch.name)
+                visit(ch, outer | _locals_of(ch))
+            else:
+                visit(ch, outer)
+
+    visit(ta, frozenset())
     return out

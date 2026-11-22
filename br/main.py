@@ -38,6 +38,7 @@ FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
 INDEPENDENT = ("::test_generator_memory", "::test_cache_does_not_retain_queries")
+SECS_CAP = float(os.environ.get("BR_SECS_CAP", "0"))
 MISS_COST = 1500.0   # ms of real executor runs allowed after memo misses (memo.MISS_BUDGET)
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
 HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
@@ -45,7 +46,7 @@ INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
 _ZY = []
 
 
-FREEZE = not os.environ.get("BR_NOFREEZE")
+FREEZE = bool(os.environ.get("BR_FREEZE"))
 
 
 def _prefork():
@@ -254,7 +255,7 @@ _ST = []
 
 _CK = []
 NORULES = bool(os.environ.get("BR_NORULES"))
-NOCK = bool(os.environ.get("BR_NOCK"))
+NOCK = not os.environ.get("BR_CK")   # constant-read narrowing: no gain on practice, off
 CK_MIN_SAVE_MS = float(os.environ.get("BR_CK_MIN_SAVE_MS", "5000"))
 
 
@@ -582,7 +583,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
 
     seen_fail = [False]
 
-    def cost(t):
+    def cost0(t):
         c = sl_est.get(t)
         if c is None:
             c = cpu.get(t, secs_ms[num_of[t]])
@@ -600,6 +601,20 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             else:
                 c = c * 0.40 + (MISS_COST if seen_fail[0] else 0.0)
         return c * CPU_SCALE
+
+    pool_tests = set()
+    for ts_ in M.pool_users.values():
+        pool_tests.update(ts_)
+
+    def cost(t):
+        # The recorded seconds are the organisers' own measurement of the whole test on their kind of
+        # machine, so a test that runs in one process cannot cost more CPU there than that (tests
+        # that fan out to a process pool can: their recorded time is wall time across workers).
+        c = cost0(t)
+        if SECS_CAP and t not in pool_tests and not (mini is not None and t == MINI_ID):
+            c = min(c, secs_ms[num_of[t]] * SECS_CAP + 10.0)
+        return c
+
 
     # Readers of an edited data file nearly always fail. Unless slicing makes confirming them
     # cheap, include them without paying to run them.

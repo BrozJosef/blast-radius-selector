@@ -28,7 +28,7 @@ CO_VARFLAGS = 0x04 | 0x08                    # *args, **kwargs
 
 
 # --------------------------------------------------------------------------- code trees
-FREEZE = not os.environ.get("BR_NOFREEZE")
+FREEZE = bool(os.environ.get("BR_FREEZE"))
 
 
 def _prefork():

@@ -172,7 +172,23 @@ class Maps:
             # covers lazy package attributes and other imports no import statement names
             for tf in self.closure().get(f, ()):
                 out |= self.by_file.get(tf, set())
+            # and every test that asks for f, or for a module that imports f, while it runs
+            # (function-level imports, importlib, lazily loaded dialects): traced one test per process
+            rt = self.rt_imports()
+            for g in [f] + list(self.importers(f, True)):
+                out |= set(rt.get(g, ()))
         return out
+
+    def rt_imports(self):
+        c = self.__dict__.get("_rt_imports")
+        if c is None:
+            try:
+                with open(os.path.join(os.path.dirname(self.path), "rtimports.bin"), "rb") as fh:
+                    c = pickle.loads(zlib.decompress(fh.read()))
+            except Exception:
+                c = {}
+            self.__dict__["_rt_imports"] = c
+        return c
 
     def closure(self):
         c = self.__dict__.get("_closure")
