@@ -133,6 +133,8 @@ def parse(text):
             while i < n and lines[i].startswith("\\"):
                 body.append(("\\", lines[i]))
                 i += 1
+            if i < n and lines[i][:1] in ("+", "-", " ") and not lines[i].startswith(("--- ", "+++ ", "-- ")):
+                raise PatchError("hunk longer than its header says")
             cur.hunks.append((os_, ol, ns, nl, body))
             cur.mode_only = False
             continue

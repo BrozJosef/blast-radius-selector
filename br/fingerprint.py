@@ -145,6 +145,12 @@ class Walker:
                 pass
             return ("O", mod, t.__qualname__, tuple((k, self.key(v, depth + 1)) for k, v in sorted(d.items())
                                                      if k not in ("parent", "_parent", "_hash", "arg_key", "index")))
+        if mod == "dataclasses":
+            if t.__name__ == "_MISSING_TYPE":
+                return ("dc-missing",)
+            if t.__name__ == "Field":
+                return ("dc-field", tuple((n, self.key(getattr(o, n, None), depth + 1))
+                                          for n in ("name", "default", "default_factory", "init", "repr", "hash", "compare", "kw_only")))
         if mod in ("functools", "typing", "threading", "_thread", "logging", "weakref", "abc", "builtins", "types",
                    "collections", "itertools", "operator", "_functools", "_collections", "decimal", "datetime"):
             if mod in ("decimal", "datetime"):

@@ -323,10 +323,56 @@ def analyze(patch_text, M):
     for fc in fcs:
         try:
             _file(fc, M, plan)
+            _guard(fc, M, plan)
         except Exception as e:  # never let an analysis bug become a miss
             plan.all = True
             plan.why("analysis error on %s: %r" % (fc.path, e))
     return plan
+
+
+def _same_ast(path, fc):
+    """True only when an in-place text edit provably leaves the module's syntax tree unchanged."""
+    import ast
+    try:
+        old = read_src(path)
+        new = patchlib.apply(old, fc)
+        return ast.dump(ast.parse(old)) == ast.dump(ast.parse(new))
+    except Exception:
+        return False
+
+
+def _guard(fc, M, plan):
+    """A floor under the per-kind analysis for patch shapes it was not written around: whatever the
+    analysis concluded, these cases get at least the selection below."""
+    if fc.mode_only and not fc.hunks:
+        return
+    structural = bool(fc.binary or fc.deleted or fc.new_file or (fc.rename and fc.old != fc.new))
+    for p in {x for x in (fc.old, fc.new, fc.path) if x}:
+        base = os.path.basename(p)
+        top = p.split("/", 1)[0]
+        in_place = not structural and p == fc.path and exists(p)
+        if base in PYTEST_CFG and (p.count("/") == 0 or top == "tests"):
+            # collection / configuration: only an in-place text edit is analysed (in _data); a
+            # conftest.py is code that pytest imports for every test below it
+            if structural or (base == "conftest.py" and not (in_place and _same_ast(p, fc))):
+                plan.all = True
+                plan.why("%s: pytest configuration added, removed, moved or rewritten" % p)
+        if top == "tests" and base == "__init__.py" and not (in_place and _same_ast(p, fc)):
+            # imported implicitly by every test module below its directory, which the import map
+            # (built from import statements) does not record
+            d = os.path.dirname(p) + "/"
+            ts = set()
+            for f, v in M.by_file.items():
+                if f.startswith(d):
+                    ts |= set(v)
+            plan.must |= ts
+            plan.why("%s: package init of %d tests" % (p, len(ts)))
+        if in_place and p.endswith(".py") and top in ("sqlglot", "tests") \
+                and not (p in M.lines or p in M.imp or p in M.imports or p in M.by_file) and not _same_ast(p, fc):
+            plan.all = True          # code no map has ever seen running
+            plan.why("%s: python file unknown to every map" % p)
+    if fc.binary and not (fc.path and exists(fc.path)) and fc.path:
+        _added(fc.path, M, plan, None)   # same shadowing / directory-walker rules as a text add
 
 
 def _all_dependents(f, M, plan, why):
