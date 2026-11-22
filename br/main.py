@@ -37,6 +37,7 @@ NONARROW = bool(os.environ.get("BR_NONARROW"))   # fingerprint may only prove "i
 FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
+B_AFTER_FAIL = float(os.environ.get("BR_B_AFTER_FAIL", "1.5"))
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
 HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
 INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
@@ -501,6 +502,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     lvl = exec_memo_ok(plan, None) if HOT else False
     mini = mini_opts(plan)
 
+    seen_fail = [False]
+
     def cost(t):
         c = sl_est.get(t)
         if c is None:
@@ -508,7 +511,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         if mini is not None and t == MINI_ID:
             c = 350.0            # the miniature run, not the 29 s original
         if lvl and t.endswith("::test_execute_tpcds"):
-            c *= 0.14 if lvl == "A" else 0.62   # measured share left once the executor stage is memoised
+            # measured share left once the executor stage is memoised; a change already seen to alter
+            # behaviour mostly misses the plan-level memo and the mutated plans tend to run longer
+            c *= 0.14 if lvl == "A" else (B_AFTER_FAIL if seen_fail[0] else 0.62)
         return c * CPU_SCALE
 
     # Readers of an edited data file nearly always fail. Unless slicing makes confirming them
@@ -633,6 +638,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     # Second look: when everything cheap passed, the rest is far less likely to fail, so paying
     # CPU to clear it (instead of a worker's time) becomes worthwhile for more tests.
     rest = [t for t in heavy if t not in sure]
+    seen_fail[0] = bool(bad)
     if rest and not broke and time.time() - T0 < WALL_BUDGET:
         # with failures already seen, an expensive candidate probably fails too: running it rarely pays
         k2 = choose(rest, list(sure) + [t for t in bad if t in num_of], P_FAIL2 if not bad else P_FAIL_AFTER,
