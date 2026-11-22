@@ -267,6 +267,9 @@ class Index:
         m = {}
         src = self.src
         FT = types.FunctionType
+        # objects parked by gc.freeze() are invisible to get_objects(): bring them back first
+        # (they are parked again right before the next fork)
+        gc.unfreeze()
         for o in gc.get_objects():
             if type(o) is FT:
                 co = o.__code__
