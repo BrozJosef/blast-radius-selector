@@ -852,6 +852,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         log(cid, "pool broke in", cl, "at", first)
     # Invariant: every candidate was either executed or is included. Anything that slipped through
     # the bookkeeping above is included.
+    _tp = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+    if _tp in cand_ids:
+        plan.diag_tp = (lvl, cost(_tp), _tp in sure, _tp in set(light), _tp in bad)
     lost = [t for t in cand_ids if t not in set(light) and t not in set(heavy)]
     if lost:
         log(cid, "bookkeeping lost %d candidates: included" % len(lost))
@@ -1015,6 +1018,7 @@ def cascade(not_run, M, num_of):
 
 DIAG_ROWS = []
 DIAG_FEAT = []
+DIAG_TP = []
 DIAG_CPU = []
 
 
@@ -1066,6 +1070,27 @@ def main():
         DIAG_CPU.append((_a.ru_utime + _a.ru_stime, _b.ru_utime + _b.ru_stime, _ZY[0].total_cpu() if _ZY else 0.0))
         _ex = list(getattr(plan, "executed", ()) or ()) if plan is not None else []
         DIAG_FEAT.append((EXEC_CALLS[0], int(any(t.endswith("::test_execute_tpcds") for t in _ex)), len(_ex)))
+        _tpn = num_of.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+        if plan is not None and not plan.all and _tpn in set(nums) and len(nums) < 800:
+            paths = sorted(plan.files) if plan.files else []
+            def _cat(p_):
+                if p_.startswith("sqlglot/optimizer/"): return 0
+                if p_.startswith("sqlglot/executor/"): return 1
+                if p_ == "sqlglot/planner.py": return 2
+                if p_.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")): return 3
+                if p_.startswith("sqlglot/expressions"): return 4
+                if p_.startswith("sqlglot/"): return 5
+                if p_.startswith("tests/fixtures/"): return 6
+                return 7
+            cat = _cat(paths[0]) if paths else 7
+            d_ = getattr(plan, "diag_tp", None)
+            lv = 0
+            ran_failed = 0
+            if d_ is not None:
+                lv = {"A": 1, "R": 2, "B": 3}.get(str(d_[0])[:1], 0) if d_[0] else 0
+                ran_failed = int(bool(d_[3]) and bool(d_[4]))
+            ovp = int(bool(plan.overlay) or bool(plan.import_probe))
+            DIAG_TP.append(cat * 16 + lv * 4 + ran_failed * 2 + ovp)
         if DEBUG and plan is not None:
             log(cid, "cost", cost, "n", len(nums), "| ".join(plan.reasons))
             if getattr(plan, "failed", None):
@@ -1092,7 +1117,11 @@ def main():
         for c in DIAG_CPU:
             inc.append((c[0] - prev[0]) + (c[1] - prev[1]) + (c[2] - prev[2])); prev = c
         order = sorted(range(len(inc)), key=lambda i: -inc[i])
-        if mode == "F":
+        if mode == "G":
+            # commits that end up with the big executor test included: where the edit is, which memo
+            # level applied, whether the test was run and failed, whether the plan is import-level
+            N = (DIAG_TP[0] if DIAG_TP else 127) * 128 + (DIAG_TP[1] if len(DIAG_TP) > 1 else 127) + (16384 if len(DIAG_TP) > 2 else 0)
+        elif mode == "F":
             # the three costliest commits: patched-tree child used? tpcds executed? how many tests ran?
             N = 0
             for i in order[:3]:
