@@ -1020,6 +1020,17 @@ def main():
     M = select.Maps(MAPS)
     cdir = os.path.join(DATA, "commits")
     out = []
+    if os.environ.get("BR_SCALEBENCH"):
+        # calibration probe: CPU of a fixed batch of ordinary tests in the warm process
+        try:
+            files_ = ("tests/dialects/test_snowflake.py", "tests/dialects/test_bigquery.py", "tests/dialects/test_tsql.py",
+                      "tests/dialects/test_duckdb.py", "tests/test_transpile.py", "tests/test_expressions.py")
+            ids_ = sorted(t["id"] for t in tests if t["id"].split("::")[0] in files_)
+            for i in range(int(os.environ["BR_SCALEBENCH"])):
+                r_ = zygote().run("bench%d" % i, {}, ids_, {}, 120.0)
+                log("scalebench", len(ids_), "failing", len(r_[0]) if r_[0] is not None else r_)
+        except Exception as e:
+            log("bench failed", repr(e))
     unknown_tests = {n for tid, n in num_of.items() if tid not in M.idx}
     if unknown_tests:
         log("tests unknown to the maps:", len(unknown_tests))
