@@ -394,6 +394,15 @@ def _guard(fc, M, plan):
                     ts |= set(v)
             plan.must |= ts
             plan.why("%s: package init of %d tests" % (p, len(ts)))
+        if in_place and p.endswith(".py") and top == "tests":
+            from . import testleak
+            try:
+                leak = testleak.may_leak(read_src(p), patchlib.apply(read_src(p), fc))
+            except Exception:
+                leak = True
+            if leak:
+                plan.all = True
+                plan.why("%s: test-side edit touches state shared across the pytest session" % p)
         if in_place and p.endswith(".py") and top in ("sqlglot", "tests") \
                 and not (p in M.lines or p in M.imp or p in M.imports or p in M.by_file) and not _same_ast(p, fc):
             plan.all = True          # code no map has ever seen running
