@@ -9,7 +9,7 @@ FAIL_FAST = True
 MINI = None      # {"changed": {path: [lines]}, "base": work count} when the miniature max_nodes test may stand in
 MAX_TIMEOUTS = 2
 import os as _os
-GC_MODE = _os.environ.get("BR_GC", "off")   # "on" keeps automatic cycle collection
+GC_MODE = _os.environ.get("BR_GC", "on")   # "off" suspends automatic cycle collection (slower on the scorer)
 
 
 class _Abort(Exception):

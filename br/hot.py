@@ -28,6 +28,16 @@ CO_VARFLAGS = 0x04 | 0x08                    # *args, **kwargs
 
 
 # --------------------------------------------------------------------------- code trees
+FREEZE = not os.environ.get("BR_NOFREEZE")
+
+
+def _prefork():
+    """Park every existing object in the permanent generation before forking: the child's
+    collections then skip the inherited heap (less scanning and far fewer copy-on-write faults)."""
+    if FREEZE:
+        import gc
+        gc.freeze()
+
 def _const_sig(c):
     if isinstance(c, types.CodeType):
         return ("<code>", c.co_name)
@@ -424,6 +434,7 @@ class _Server:
             self.index.rebuild()
         before = set(sys.modules)
         r, w = os.pipe()
+        _prefork()
         pid = os.fork()
         if pid == 0:
             code = 1
@@ -529,6 +540,7 @@ class Zygote:
     def start(self):
         to_r, to_w = os.pipe()      # parent -> zygote
         from_r, from_w = os.pipe()  # zygote -> parent
+        _prefork()
         pid = os.fork()
         if pid == 0:
             try:

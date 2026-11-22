@@ -295,6 +295,7 @@ class Plan:
         self.data_files = {}       # changed data file -> (old text, new text)
         self.ranges = {}           # path -> (old line ranges, new line ranges) touched by the patch
         self.attr_keys = set()     # "module:Class.attr" keys the patch assigns; None when not expressible
+        self.attr_import_reads = False   # an assigned constant is also named in import-time code
         self.ck = {}               # attr key -> (changed entry indexes, entry count) for value-only dict edits; None if any other kind
         self.attr_rt = set()       # tests that read those attributes at run time
         self.attr_classes = set()  # "module:Class" whose body the patch changes; None when not only that
@@ -773,6 +774,8 @@ def _import_change(path, ic, M, plan):
                     art |= M.cover(f, (l,))   # function code: whoever runs it at run time may read the value
                 elif f.startswith("tests/"):
                     escaped = True            # read while a test module is imported: its copy is not fingerprinted
+                else:
+                    plan.attr_import_reads = True   # named at import time somewhere: state derived from it is likely
             plan.attr_keys.add("%s:%s%s" % (M.mod(path), (ic.scope + ".") if ic.scope else "", nm))
             if plan.ck is not None:
                 dv = getattr(ic, "dict_vals", None)

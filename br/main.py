@@ -37,12 +37,23 @@ NONARROW = not os.environ.get("BR_NARROW")   # fingerprint may only prove "ident
 FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
+INDEPENDENT = ("::test_generator_memory", "::test_cache_does_not_retain_queries")
 MISS_COST = 1500.0   # ms of real executor runs allowed after memo misses (memo.MISS_BUDGET)
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
 HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
 INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
 _ZY = []
 
+
+FREEZE = not os.environ.get("BR_NOFREEZE")
+
+
+def _prefork():
+    """Park every existing object in the permanent generation before forking: the child's
+    collections then skip the inherited heap (less scanning and far fewer copy-on-write faults)."""
+    if FREEZE:
+        import gc
+        gc.freeze()
 
 def zygote():
     if not _ZY:
@@ -98,6 +109,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
         log("overlay failed", cid, repr(e))
         return None
     r, w = os.pipe()
+    _prefork()
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -500,7 +512,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
         rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
         gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
-        if plan.attr_change and plan.attr_keys and cand_ids:
+        if plan.attr_change and plan.attr_keys and cand_ids and not plan.attr_import_reads:
             # what the traced readers of the assigned constants would leave if the fingerprint agrees:
             # worth its import-and-digest child only when it spares a lot of verification
             ck0 = ck_readers(plan, sorted(plan.attr_keys), M)
@@ -721,8 +733,20 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     rest = sorted((t for t in heavy if t not in sure), key=lambda t: cost(t) / max(1.0, secs_ms[num_of[t]] + 20.0))
     if rest and not broke and time.time() - T0 < WALL_BUDGET:
         # with failures already seen, an expensive candidate probably fails too: running it rarely pays
-        k2 = choose(rest, list(sure) + [t for t in bad if t in num_of], P_FAIL2 if not bad else P_FAIL_AFTER,
-                    {t.rsplit("::", 1)[0] for t in light})
+        failed_ids = [t for t in bad if t in num_of]
+        ran_classes = {t.rsplit("::", 1)[0] for t in light}
+        if bad:
+            # Tests that measure resource use rather than output fail independently of the failures
+            # just seen; decide them with the calm prior, the rest with the pessimistic one.
+            indep = [t for t in rest if t.endswith(INDEPENDENT)]
+            other = [t for t in rest if not t.endswith(INDEPENDENT)]
+            ka = choose(indep, list(sure) + failed_ids + other, P_FAIL2, ran_classes) if indep else 0
+            kb = choose(other, list(sure) + failed_ids + indep[ka:], P_FAIL_AFTER, ran_classes) if other else 0
+            more = indep[:ka] + other[:kb]
+            rest = more + indep[ka:] + other[kb:]
+            k2 = len(more)
+        else:
+            k2 = choose(rest, list(sure), P_FAIL2, ran_classes)
         if k2:
             more = rest[:k2]
             t_s2 = time.process_time()
@@ -766,9 +790,11 @@ _MINI_BASE = []
 
 def mini_opts(plan):
     """Options for the miniature max_nodes test: only when every changed line is known."""
-    if NOMINI or not plan.lines_ok or plan.overlay or plan.import_probe or plan.renames or not plan.lines:
+    # In-place edits of library modules only, function-level or import-level: the replica runs the
+    # same statements against the patched code either way.
+    if NOMINI or plan.renames or plan.all or plan.no_exec or not plan.files:
         return None
-    if any(not p.startswith("sqlglot/") or not p.endswith(".py") for p in plan.files):
+    if any(not p.startswith("sqlglot/") or not p.endswith(".py") or c is None for p, c in plan.files.items()):
         return None
     if not _MINI_BASE:
         try:
@@ -778,7 +804,19 @@ def mini_opts(plan):
             _MINI_BASE.append(None)
     if _MINI_BASE[0] is None:
         return None
-    return {"changed": {p: sorted(ls) for p, ls in plan.lines.items()}, "base": _MINI_BASE[0]}
+    changed = {p: set(ls) for p, ls in plan.lines.items()}
+    for p in plan.files:
+        rs = plan.ranges.get(p)
+        rs = rs[0] if rs else None           # (old-side ranges, new-side ranges)
+        if not rs and p not in changed:
+            return None                      # no idea which old lines this file's edit touches
+        for r in rs or ():
+            try:
+                a_, b_ = int(r[0]), int(r[1])
+            except Exception:
+                return None
+            changed.setdefault(p, set()).update(range(a_, max(a_, b_) + 1))
+    return {"changed": {p: sorted(ls) for p, ls in changed.items()}, "base": _MINI_BASE[0]}
 
 
 

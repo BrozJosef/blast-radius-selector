@@ -58,9 +58,8 @@ How it works:
    used only when it spares several seconds of verification (the import-and-
    digest child is not free); `BR_NOCK=1` turns it off. Reads made while a
    test module is imported count for every test of that module.
-   Verification runs switch automatic cycle collection off (`BR_GC=on` keeps
-   it): the processes are short-lived and tests that need a collection ask
-   for one explicitly.
+   Before each fork the parent calls `gc.freeze()`, so collections in the
+   child skip the inherited heap.
 8. `br/maxnodes_mini.py` is a scaled-down run of `test_max_nodes` (same
    statements, 30 columns instead of 10,000). The 29-second original is included
    only if the patch touches the node-limit lines, the scaled run fails, or it
