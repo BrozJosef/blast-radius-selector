@@ -526,7 +526,42 @@ def cascade(not_run, M, num_of):
     return out
 
 
+def bench_main():
+    """Calibration probe: a fixed workload, then every test for every commit."""
+    tj = json.load(open(os.path.join(DATA, "tests.json")))
+    tests = tj["tests"]
+    secs_ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
+    ids = [t["id"] for t in tests if t["file"] in ("tests/dialects/test_bigquery.py", "tests/dialects/test_snowflake.py",
+                                                    "tests/test_transpile.py", "tests/test_expressions.py")]
+    pid = os.fork()
+    if pid == 0:
+        try:
+            dn = os.open(os.devnull, os.O_RDWR)
+            os.dup2(dn, 1)
+            os.dup2(dn, 2)
+            os.chdir(SRC)
+            sys.path.insert(0, SRC)
+            from . import runner
+            for _ in range(3):
+                runner.run_ids(ids)
+        finally:
+            os._exit(0)
+    os.waitpid(pid, 0)
+    workers, _ = packer.pack({t["number"] for t in tests}, secs_ms)
+    out = []
+    for name in sorted(os.listdir(os.path.join(DATA, "commits"))):
+        if name.endswith(".patch"):
+            out.append(json.dumps({"commit": name[:-6], "workers": workers}, separators=(",", ":")))
+    sys.stdout.write("\n".join(out) + "\n")
+    try:
+        log("cgroup", open("/sys/fs/cgroup/cpu.stat").read().split("\n")[0])
+    except Exception:
+        pass
+
+
 def main():
+    if os.environ.get("BR_PROBE_MODE") == "bench":
+        return bench_main()
     tj = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tj["tests"]
     num_of = {t["id"]: t["number"] for t in tests}
