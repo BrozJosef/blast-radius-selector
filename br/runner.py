@@ -6,6 +6,7 @@ import unittest
 
 
 FAIL_FAST = True
+MINI = None      # {"changed": {path: [lines]}, "base": work count} when the miniature max_nodes test may stand in
 MAX_TIMEOUTS = 2
 
 
@@ -34,6 +35,8 @@ class _Result(unittest.TestResult):
     def addError(self, test, err):
         if err and err[0] is Timeout:
             self.timeouts += 1
+            if self.pool_broke_at is None and isinstance(test, unittest.TestCase) and hasattr(type(test), "pool"):
+                self.pool_broke_at = test.id()   # its hung tasks keep the class-wide pool's workers busy
             if self.timeouts >= MAX_TIMEOUTS:
                 self.shouldStop = True   # a hanging mutant: do not burn the budget on every remaining test
         super().addError(test, err)
@@ -61,6 +64,8 @@ class _Result(unittest.TestResult):
             self.bad.add(test.id())
             if err[0] is Timeout:
                 self.timeouts += 1
+                if self.pool_broke_at is None and hasattr(type(test), "pool"):
+                    self.pool_broke_at = test.id()
                 if self.timeouts >= MAX_TIMEOUTS:
                     self.shouldStop = True
             if FAIL_FAST:
@@ -119,6 +124,20 @@ def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
     info = {}
     by_class = {}
     install_logging()
+    if MINI is not None:
+        from . import maxnodes_mini
+        if maxnodes_mini.TEST_ID in ids:
+            # A scaled-down run of the same statements decides whether the 29 s original is needed.
+            ids = [t for t in ids if t != maxnodes_mini.TEST_ID]
+            try:
+                inc, why = maxnodes_mini.decide({k: set(v) for k, v in (MINI.get("changed") or {}).items()}, MINI.get("base"))
+            except BaseException as e:  # noqa
+                if isinstance(e, KeyboardInterrupt):
+                    raise
+                inc, why = True, "replica error %r" % (e,)
+            if inc:
+                failing.add(maxnodes_mini.TEST_ID)
+            info["mini_max_nodes"] = why
     for tid in ids:
         f, c, m = tid.split("::")
         by_class.setdefault((f, c), []).append((m, tid))

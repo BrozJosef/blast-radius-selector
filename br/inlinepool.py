@@ -6,6 +6,23 @@ from concurrent.futures import Future
 
 
 BROKEN = []   # one entry per executor whose (emulated) worker died
+IN_PICKLE = [0]  # >0 while a task or reply is being pickled/unpickled (used by offline tracing)
+
+
+def _dumps(o):
+    IN_PICKLE[0] += 1
+    try:
+        return pickle.dumps(o)
+    finally:
+        IN_PICKLE[0] -= 1
+
+
+def _loads(b):
+    IN_PICKLE[0] += 1
+    try:
+        return pickle.loads(b)
+    finally:
+        IN_PICKLE[0] -= 1
 
 
 class InlineExecutor:
@@ -31,9 +48,9 @@ class InlineExecutor:
                 self._inited = True
                 if self._init[0]:
                     # a spawned worker receives the initializer and its arguments through pickle
-                    blob = pickle.dumps(self._init)
+                    blob = _dumps(self._init)
                     try:
-                        ifn, iargs = pickle.loads(blob)
+                        ifn, iargs = _loads(blob)
                     except BaseException as e:
                         if type(e).__name__ == "Timeout":
                             raise
@@ -41,14 +58,14 @@ class InlineExecutor:
                         BROKEN.append(self)
                         return self._broken_future()
                     ifn(*iargs)
-            data = pickle.dumps((fn, args, kwargs))
+            data = _dumps((fn, args, kwargs))
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)) or type(e).__name__ == "Timeout":
                 raise
             f.set_exception(e)   # the parent could not send the task: only this future fails
             return f
         try:
-            fn, args, kwargs = pickle.loads(data)
+            fn, args, kwargs = _loads(data)
         except BaseException as e:
             if isinstance(e, (KeyboardInterrupt, SystemExit)) or type(e).__name__ == "Timeout":
                 raise
@@ -67,14 +84,14 @@ class InlineExecutor:
     def _back(self, f, obj, is_exc):
         """Send a result (or exception) back the way a worker would."""
         try:
-            blob = pickle.dumps(obj)
+            blob = _dumps(obj)
         except BaseException as e2:
             if type(e2).__name__ == "Timeout":
                 raise
             f.set_exception(e2)       # the worker reports the pickling error instead
             return f
         try:
-            back = pickle.loads(blob)
+            back = _loads(blob)
         except BaseException as e3:
             if type(e3).__name__ == "Timeout":
                 raise

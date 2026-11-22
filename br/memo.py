@@ -166,7 +166,7 @@ def _key(o, seen):
     if t in (list, tuple):
         return ("l", tuple(_key(x, seen) for x in o))
     if t is dict:
-        return ("d", tuple(sorted(((repr(_key(k, seen)), _key(v, seen)) for k, v in o.items()), key=lambda kv: kv[0])))
+        return ("d", tuple((_key(k, seen), _key(v, seen)) for k, v in o.items()))   # insertion order kept
     if t in (set, frozenset):
         return ("s", tuple(sorted((_key(x, seen) for x in o), key=repr)))
     if isinstance(o, type):
@@ -196,7 +196,7 @@ def _key(o, seen):
                 v = getattr(o, name, None)
                 if v is not None:
                     extra.append((name, _key(v, seen)))
-            r = ("E", t.__qualname__, tuple((k, _key(v, seen)) for k, v in sorted(d.items())), tuple(extra))
+            r = ("E", t.__qualname__, tuple((k, _key(v, seen)) for k, v in d.items()), tuple(extra))
         finally:
             path.discard(i)
         cache[i] = r
@@ -208,8 +208,11 @@ def _key(o, seen):
             return ("?", i)
         path.add(i)
         try:
-            r = ("O", mod, t.__qualname__, tuple((k, _key(v, seen)) for k, v in sorted(d.items())
-                                                  if k not in ("dependents", "_dag", "reader", "range_reader")))
+            deps = d.get("dependents")
+            dn = tuple(sorted((type(x).__qualname__, str(getattr(x, "name", None))) for x in deps)) \
+                if isinstance(deps, (set, frozenset, list, tuple)) else ()
+            r = ("O", mod, t.__qualname__, dn, tuple((k, _key(v, seen)) for k, v in sorted(d.items())
+                                                      if k not in ("dependents", "_dag", "reader", "range_reader")))
         finally:
             path.discard(i)
         cache[i] = r
@@ -360,9 +363,14 @@ def build(out=PATH):
                 return mon.DISABLE
         return None
 
+    def on_start(code, off):
+        # a body on the def/lambda line raises no LINE event: record function entry as its first line
+        return on_line(code, code.co_firstlineno)
+
     mon.use_tool_id(tid, "br-stage")
     mon.register_callback(tid, mon.events.LINE, on_line)
-    mon.set_events(tid, mon.events.LINE)
+    mon.register_callback(tid, mon.events.PY_START, on_start)
+    mon.set_events(tid, mon.events.LINE | mon.events.PY_START)
     install_exec(rec_exec, inside)
     install_query(rec_query, inside_q)
     names = [n for n in dir(te.TestExecutor) if n.startswith("test_")]

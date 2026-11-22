@@ -78,6 +78,102 @@ def is_func(co):
     return bool(co.co_flags & CO_OPTIMIZED)
 
 
+STUB = not os.environ.get("BR_NOSTUB")
+
+
+def _isb(line, ind=""):
+    """Does this line start a new statement at indentation `ind`?"""
+    if not line.startswith(ind):
+        return bool(line.strip()) and not line.startswith(" " * len(ind))  # dedent: surely a boundary
+    r = line[len(ind):]
+    return r[:1] not in ("", " ", "\t", "#", ")", "]", "}") and not r.startswith(("else", "elif", "except", "finally"))
+
+
+def stub_pair(old, new, ranges):
+    """Blank out everything except the top-level statement(s) (and, inside a large class, the
+    methods) that the patch touches, identically in both versions. Compiling the stubs yields the
+    same code objects for the changed functions at a fraction of the cost. None when unsure."""
+    try:
+        ro, rn = ranges
+        if not ro or not rn:
+            return None
+        ol, nl = old.split("\n"), new.split("\n")
+        first = max(1, min(min(a for a, b in ro), min(a for a, b in rn)))
+        last_o, last_n = max(b for a, b in ro), max(b for a, b in rn)
+        delta = len(nl) - len(ol)
+
+        def region(ind, lo, hi_o):
+            s = min(first, hi_o)
+            while s > lo and not _isb(ol[s - 1], ind):
+                s -= 1
+            while s > lo and ol[s - 2].startswith(ind + "@"):
+                s -= 1
+            e = max(last_o + 1, s + 1)
+            while e <= hi_o and not _isb(ol[e - 1], ind):
+                e += 1
+            return s, e
+
+        s, e_o = region("", 1, len(ol))
+        e_n = e_o + delta
+        if e_n <= last_n or s > first or ol[:s - 1] != nl[:s - 1] or ol[e_o - 1:] != nl[e_n - 1:]:
+            return None
+        keep_o = [False] * len(ol)
+        keep_n = [False] * len(nl)
+        for i in range(s - 1, min(e_o - 1, len(ol))):
+            keep_o[i] = True
+        for i in range(s - 1, min(e_n - 1, len(nl))):
+            keep_n[i] = True
+        head = ol[s - 1]
+        while head.startswith("@") and s < len(ol):
+            break
+        if e_o - s > 150 and any(ol[i].startswith("class ") for i in range(s - 1, min(s + 8, len(ol)))):
+            # a large class: keep only the members the patch touches, blank the other methods
+            ms, me_o = region("    ", s, e_o - 1)
+            me_n = me_o + delta
+            if ms > s and me_n > last_n and ms <= first:
+                i = s - 1
+                n_o = e_o - 1
+                j = i
+                while j < n_o:
+                    line = ol[j]
+                    if line.startswith(("    def ", "    async def ", "    @")) and not (ms - 1 <= j < me_o - 1):
+                        k = j + 1
+                        while k < n_o and not (_isb(ol[k], "    ") and not ol[k - 1].startswith("    @")):
+                            k += 1
+                        if k <= ms - 1 or j >= me_o - 1:
+                            for q in range(j, k):
+                                keep_o[q] = False
+                                keep_n[q if q < ms - 1 else q + delta] = False
+                        j = k
+                    else:
+                        j += 1
+        # Module-level imports and compound statements stay: the compiler emits different code for
+        # names it knows are imported modules, and `from __future__` changes compilation outright.
+        KEEP = ("import ", "from ", "if ", "try:", "with ", "for ", "while ")
+        i = 0
+        while i < len(ol):
+            if _isb(ol[i]) and ol[i].startswith(KEEP):
+                j = i + 1
+                while j < len(ol) and not _isb(ol[j]):
+                    j += 1
+                for q in range(i, j):
+                    if q < s - 1:
+                        keep_o[q] = True
+                        keep_n[q] = True
+                    elif q >= e_o - 1:
+                        keep_o[q] = True
+                        if 0 <= q + delta < len(nl):
+                            keep_n[q + delta] = True
+                i = j
+            else:
+                i += 1
+        so = "\n".join(l if k else "" for l, k in zip(ol, keep_o))
+        sn = "\n".join(l if k else "" for l, k in zip(nl, keep_n))
+        return so, sn
+    except Exception:
+        return None
+
+
 class Cannot(Exception):
     pass
 
@@ -228,6 +324,8 @@ class _Server:
         self.debug = debug
         self.index = Index(self.src)
         self.old_code = {}  # relpath -> compiled original module code (or Cannot)
+        self.old_text = {}
+        self.news = {}
 
     def setup(self):
         devnull = os.open(os.devnull, os.O_RDWR)
@@ -299,7 +397,29 @@ class _Server:
                 self.ensure(modname(f))
             except BaseException as e:  # noqa: BLE001
                 raise Cannot("cannot import test module %s: %r" % (f, e))
-        olds = {rel: self.original(rel) for rel in files}
+        olds = {}
+        news = {}
+        for rel in files:
+            rg = (job.get("ranges") or {}).get(rel)
+            done = False
+            if rg and STUB:
+                try:
+                    path = os.path.join(self.src, rel)
+                    old_text = self.old_text.get(rel)
+                    if old_text is None:
+                        with open(path, encoding="utf-8", newline="") as f:
+                            old_text = self.old_text[rel] = f.read()
+                    sp = stub_pair(old_text, files[rel], rg)
+                    if sp is not None:
+                        olds[rel] = compile(sp[0], path, "exec", dont_inherit=True)
+                        news[rel] = compile(sp[1], path, "exec", dont_inherit=True)
+                        done = True
+                except BaseException:  # noqa: BLE001
+                    done = False
+            if not done:
+                news.pop(rel, None)
+                olds[rel] = self.original(rel)
+        self.news = news
         if self.index.dirty:
             self.index.rebuild()
         before = set(sys.modules)
@@ -367,10 +487,12 @@ class _Server:
             slices.install()
         for rel, text in files.items():
             path = os.path.join(self.src, rel)
-            try:
-                new = compile(text, path, "exec", dont_inherit=True)
-            except BaseException as e:  # noqa: BLE001
-                raise Cannot("patched source does not compile: %r" % (e,))
+            new = self.news.get(rel)
+            if new is None:
+                try:
+                    new = compile(text, path, "exec", dont_inherit=True)
+                except BaseException as e:  # noqa: BLE001
+                    raise Cannot("patched source does not compile: %r" % (e,))
             pairs = plan_patch(olds[rel], new)
             if not pairs:
                 raise Cannot("no code difference in %s" % rel)
@@ -388,6 +510,7 @@ class _Server:
                 npatched += 1
         from . import runner
         runner.MEMO_OK = not any(p.startswith("tests/") for p in files)
+        runner.MINI = (opts or {}).get("mini")
         bad, info = runner.run_ids(ids, limits)
         newmods = [m for m in sys.modules if m not in before and m.startswith(("sqlglot", "tests"))]
         return {"failing": sorted(bad), "info": info, "newmods": newmods, "patched": npatched}
@@ -453,7 +576,7 @@ class Zygote:
     def total_cpu(self):
         return self.cpu_dead + self.cpu
 
-    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None, override=None, opts=None):
+    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None, override=None, opts=None, ranges=None):
         """files: {relpath: full new source}. Returns (failing set | None, reason)."""
         if self.pid is None:
             try:
@@ -462,7 +585,7 @@ class Zygote:
                 return None, "cannot start zygote: %r" % (e,)
         try:
             _send(self.w, {"cid": cid, "files": files, "ids": list(ids), "limits": limits, "timeout": timeout,
-                           "allow": {k: sorted(v) for k, v in (allow or {}).items()}, "override": override or {}, "opts": opts or {}})
+                           "allow": {k: sorted(v) for k, v in (allow or {}).items()}, "override": override or {}, "opts": opts or {}, "ranges": ranges or {}})
         except OSError as e:
             self.stop()
             return None, "zygote gone: %r" % (e,)

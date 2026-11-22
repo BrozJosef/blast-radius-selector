@@ -23,12 +23,16 @@ DEBUG = os.environ.get("BR_DEBUG")
 RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "20000"))    # never execute a test slower than this
 RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "30000"))
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "3.0"))   # offline CPU map -> expected CPU on the scorer
-P_FAIL = float(os.environ.get("BR_P_FAIL", "0.4"))  # nor a batch bigger than this
+P_FAIL = float(os.environ.get("BR_P_FAIL", "0.3"))  # nor a batch bigger than this
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))                  # stop executing after this many seconds
 WALL_HARD = float(os.environ.get("BR_WALL_HARD", "165"))               # no child may run past this
 NOEXEC = bool(os.environ.get("BR_NOEXEC"))
 HOT = not os.environ.get("BR_NOHOT")
 NOSLICE = bool(os.environ.get("BR_NOSLICE"))
+NOMINI = bool(os.environ.get("BR_NOMINI"))
+ASSUME_UNAFFECTED = bool(os.environ.get("BR_ASSUME_UNAFFECTED"))   # simulation only
+FP = not os.environ.get("BR_NOFP")
+FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
 _ZY = []
@@ -47,6 +51,8 @@ def log(*a):
 
 _pre = set()
 LAST_INFO = {}
+ORACLE = None    # offline simulation hook: (cid, tests) -> failing subset
+SPENT = [0.0]    # simulated CPU ms
 
 
 def preimport(ids):
@@ -73,7 +79,10 @@ def preimport(ids):
             log("preimport failed", repr(e))
 
 
-def execute(cid, plan, ids, limits, timeout, allow=None):
+LAST_FP = [None]
+
+
+def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     """Fork a child that runs `ids` against the patched tree. Returns failing set or None on trouble."""
     preimport(ids)
     root = os.path.join(TMP, "ov_" + cid)
@@ -98,12 +107,21 @@ def execute(cid, plan, ids, limits, timeout, allow=None):
             from . import inlinepool, runner
             inlinepool.install()
             runner.MEMO_OK = not plan.renames and not any(p.startswith("tests/") for p in plan.files)
+            runner.MINI = mini
             if allow:
                 from . import slices as _s
                 _s.ALLOW.clear()
                 _s.ALLOW.update({k: set(v) for k, v in allow.items()})
                 _s.install()
             broken = []
+            bad_imports = None
+            if fp:
+                # same import order as when the baseline fingerprint was taken
+                try:
+                    from . import fingerprint
+                    bad_imports = fingerprint.import_all()
+                except BaseException:  # noqa
+                    bad_imports = None
             for path in sorted(plan.import_probe):
                 if not path.endswith(".py"):
                     continue
@@ -114,11 +132,24 @@ def execute(cid, plan, ids, limits, timeout, allow=None):
                     __import__(name)
                 except BaseException as e:  # noqa
                     broken.append(path)
+            changed = None
+            if fp and not broken:
+                # did importing the patched code leave any state different from the pinned tree's?
+                try:
+                    from . import fingerprint
+                    base = fingerprint.load()
+                    if base is not None and bad_imports is not None:
+                        mods, defs = fingerprint.changed_attrs(base)
+                        if sorted(bad_imports) != sorted(base["failed"]):
+                            mods.append("<imports>")
+                        changed = [mods[:200], defs[:200]]
+                except BaseException as e:  # noqa
+                    changed = None
             if broken:
                 bad, info = set(), {"import_broken": broken}
             else:
                 bad, info = runner.run_ids(ids, limits)
-            os.write(w, json.dumps({"failing": sorted(bad), "info": info, "broken": broken}).encode())
+            os.write(w, json.dumps({"failing": sorted(bad), "info": info, "broken": broken, "fp": changed}).encode())
             code = 0
         except BaseException as e:  # noqa
             try:
@@ -166,6 +197,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None):
     if not res or "error" in res:
         log("exec trouble", cid, (res or {}).get("error", "no result/timeout"))
         return None
+    LAST_FP[0] = res.get("fp")
     LAST_INFO.clear()
     LAST_INFO.update(res.get("info") or {})
     if res.get("info"):
@@ -243,6 +275,7 @@ def plan_slices(plan, cand_ids, M):
     S = slicemap()
     need = {}      # fixture name -> set of entries, or None for everything
     est = {}
+    frac = {}
     cset = set(cand_ids)
     # (1) edited fixture files: only the entries whose text changed
     for path, (old, new) in plan.data_files.items():
@@ -293,8 +326,13 @@ def plan_slices(plan, cand_ids, M):
             whole = True
         if plan.overlay and not plan.lines and plan.files and not all(p in plan.data_files for p in plan.files):
             whole = True           # some other kind of change (import level): no slicing
-        c = rec["resid_cpu"]
+        # per-entry cost net of the fixed part every run of the test pays (class setup, scaffolding)
+        base = rec["resid_cpu"]
+        tot_net = 0.0
+        want_net = 0.0
         for F, n in rec["files"].items():
+            net = [max(0.0, x - base) for x in rec["cpu"][F]]
+            tot_net += sum(net)
             if whole:
                 want = None
             else:
@@ -305,35 +343,43 @@ def plan_slices(plan, cand_ids, M):
                     want = None
             if want is None:
                 need[F] = None
-                c += sum(rec["cpu"][F])
+                want_net += sum(net)
             else:
                 if need.get(F, set()) is not None:
                     need[F] = need.get(F, set()) | want
-                c += sum(rec["cpu"][F][k] for k in want if k < n)
-        full = max(1.0, rec["cpu_full"])
-        est[t] = M.cpu.get(t, full) * min(1.0, c / full)
+                want_net += sum(net[k] for k in want if k < n)
+        share = (want_net / tot_net) if tot_net > 0 else 1.0
+        fixed = min(0.5, base / max(1.0, rec["cpu_full"]))       # part of the test that slicing cannot remove
+        est[t] = M.cpu.get(t, rec["cpu_full"]) * min(1.0, fixed * 0.3 + (1 - fixed * 0.3) * share)
+        frac[t] = (rec, base, tot_net)
     # a fixture restricted here must not be read in full by a candidate we cannot slice
     allow = {}
     for F, want in need.items():
         if want is None:
             continue
         readers = {M.tests[i] for i in M.readers(FIX + F)} & cset
-        if any(r not in S["tests"] and FIX + F not in plan.data_files for r in readers):
+        # a candidate that reads this fixture but was never checked against slicing needs it whole
+        if not ASSUME_UNAFFECTED and any(r not in S["tests"] and r not in S.get("unaffected", ()) and FIX + F not in plan.data_files for r in readers):
             continue
         allow[F] = want
     for t in list(est):
-        rec = S["tests"][t]
+        rec, base, tot_net = frac[t]
         if any(F not in allow for F in rec["files"]):
-            # some file of this test stays unsliced: fall back to the measured full cost share
-            c = rec["resid_cpu"] + sum(sum(rec["cpu"][F]) if F not in allow else sum(rec["cpu"][F][k] for k in allow[F] if k < n)
-                                       for F, n in rec["files"].items())
-            est[t] = M.cpu.get(t, rec["cpu_full"]) * min(1.0, c / max(1.0, rec["cpu_full"]))
+            # some file of this test stays unsliced after all: recompute its share
+            w = 0.0
+            for F, n in rec["files"].items():
+                net = [max(0.0, x - base) for x in rec["cpu"][F]]
+                w += sum(net) if F not in allow else sum(net[k] for k in allow[F] if k < n)
+            share = (w / tot_net) if tot_net > 0 else 1.0
+            fixed = min(0.5, base / max(1.0, rec["cpu_full"]))
+            est[t] = M.cpu.get(t, rec["cpu_full"]) * min(1.0, fixed * 0.3 + (1 - fixed * 0.3) * share)
     return allow, est
 
 
 def decide(cid, patch_text, M, tests, num_of, secs_ms):
     """Returns list of test numbers to run for this commit."""
     plan = select.analyze(patch_text, M)
+    CASCADE_PLAN[0] = plan
     all_nums = [t["number"] for t in tests]
     if plan.all:
         log(cid, "ALL", plan.reasons[-1:])
@@ -345,6 +391,50 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     fallback = broad if plan.import_probe else incl(cand_ids)
     if NOEXEC or plan.no_exec or time.time() - T0 > WALL_BUDGET:
         return sorted(set(fallback) | set(cascade(cand_ids, M, num_of))), plan
+    if ORACLE is not None and plan.import_probe:
+        SPENT[0] += 300.0
+        if ORACLE(cid, None) == "BROKEN":
+            return broad, plan
+        if plan.fp_ok and FP:
+            # simulation stand-in for the import-state fingerprint (optimistic: equal whenever truth allows)
+            rt_ids = [M.tests[i] for i in plan.rt if M.tests[i] in num_of]
+            gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
+            if gain >= FP_MIN_GAIN_MS:
+                SPENT[0] += 3500.0
+                if not plan.attr_change and ORACLE(cid, ("FP", rt_ids)):
+                    cand_ids = rt_ids
+                    plan.cands = set(plan.rt)
+                    fallback = incl(cand_ids)
+        plan.import_probe = set()
+    if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
+        rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
+        gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
+        if gain >= FP_MIN_GAIN_MS:
+            LAST_FP[0] = None
+            r = execute(cid, plan, [], {}, 25.0, fp=True)
+            if r is None or r == "BROKEN":
+                log(cid, "import broken -> broad", len(broad))
+                return broad, plan
+            fpres = LAST_FP[0]
+            same = bool(fpres) and fpres[0] == [] and set(fpres[1]) <= plan.header_funcs
+            if (not same and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
+                    and set(fpres[0]) <= plan.attr_keys and set(fpres[1]) <= plan.header_funcs):
+                # only the attributes the patch assigns differ: nothing was derived from them at import,
+                # so only tests that read them at run time can see the change
+                art = [M.tests[i] for i in (plan.rt | plan.attr_rt) if M.tests[i] in num_of]
+                log(cid, "only %s changed at import: %d -> %d candidates" % (sorted(fpres[0])[:3], len(cand_ids), len(art)))
+                plan.why("import-time state differs only in the assigned attributes")
+                cand_ids = art
+                plan.cands = set(plan.rt | plan.attr_rt)
+            elif same:
+                log(cid, "import-time state unchanged: %d -> %d candidates" % (len(cand_ids), len(rt_ids)))
+                plan.why("import-time state identical to the pinned tree")
+                cand_ids = rt_ids
+                plan.cands = set(plan.rt)
+            else:
+                log(cid, "import-time state differs in", (fpres[0][:5], fpres[1][:5]) if fpres else "?")
+            plan.import_probe = set()      # already probed
+            fallback = incl(cand_ids)
     if not cand_ids:
         if plan.import_probe:
             r = execute(cid, plan, [], {}, 12.0)
@@ -356,11 +446,14 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     cpu = M.cpu
 
     lvl = exec_memo_ok(plan, None) if HOT else False
+    mini = mini_opts(plan)
 
     def cost(t):
         c = sl_est.get(t)
         if c is None:
             c = cpu.get(t, secs_ms[num_of[t]])
+        if mini is not None and t == MINI_ID:
+            c = 350.0            # the miniature run, not the 29 s original
         if lvl and t.endswith("::test_execute_tpcds"):
             c *= 0.14 if lvl == "A" else 0.62   # measured share left once the executor stage is memoised
         return c * CPU_SCALE
@@ -382,6 +475,13 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         best = (full, 0)
         run_ms = 60.0
         classes = set(spent_classes)
+        n = len(order)
+        # packing is not free: evaluate a handful of prefix lengths, not every one
+        marks = {n}
+        k = 1
+        while k < n:
+            marks.add(k)
+            k = k + 1 if k < 4 else int(k * 1.6) + 1
         for k, t in enumerate(order, 1):
             c = cost(t)
             if c > RUN_MAX_TEST_MS:
@@ -393,6 +493,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             run_ms += c
             if run_ms > RUN_MAX_TOTAL_MS:
                 break
+            if k not in marks and not (k < n and cost(order[k]) > 4 * max(c, 50.0)):
+                continue
             rest = list(order[k:]) + list(fixed)
             br = blind(rest) if rest else 0
             # what we run still fails with probability p_fail, and then costs what it would have blind
@@ -413,10 +515,15 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         return sorted(set(incl(cand_ids)) | set(cascade(cand_ids, M, num_of))), plan
 
     def run(ts):
+        if ORACLE is not None:
+            SPENT[0] += 60.0 + sum(cost(t) for t in ts) + sum(M.cpu_class.get(c_, 0) * CPU_SCALE for c_ in {t.rsplit("::", 1)[0] for t in ts})
+            LAST_INFO.clear()
+            return ORACLE(cid, ts)
         total = sum(cost(t) for t in ts)
         # a test gets several times its expected CPU before it counts as hung
-        limits = {t: max(8.0, 0.012 * max(cpu.get(t, 0), secs_ms[num_of[t]] * 0.3)) for t in ts}
-        timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(25.0, 0.012 * total + 15.0))
+        # a test gets about four times its expected CPU on the scorer before it counts as hung
+        limits = {t: max(6.0, 0.004 * cost(t)) for t in ts}
+        timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(15.0, 0.004 * total + 10.0))
         bad = None
         fx = fixture_only(plan, ts, allow)
         if HOT and (fx is not None or hot.eligible(plan)):
@@ -424,16 +531,19 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 preimport(ts)
                 files = {} if fx is not None else {f: plan.files[f] for f in {f for f, _ in plan.hot}}
                 bad, why = zygote().run(cid, files, ts, limits, timeout, allow=allow, override=fx,
-                                        opts={"exec_memo": exec_memo_ok(plan, fx)})
+                                        opts={"exec_memo": exec_memo_ok(plan, fx), "mini": mini},
+                                        ranges={f: plan.ranges[f] for f in files if f in plan.ranges})
                 LAST_INFO.clear()
                 LAST_INFO.update(getattr(zygote(), "last_info", None) or {})
                 if bad is None:
                     log(cid, "hot fallback:", why)
+                    if "timeout" in str(why):
+                        return None      # do not burn the same time again in an overlay child
             except Exception as e:
                 log(cid, "hot error", repr(e))
                 bad = None
         if bad is None:
-            bad = execute(cid, plan, ts, limits, timeout, allow)
+            bad = execute(cid, plan, ts, limits, timeout, allow, mini=mini)
         return bad
 
     bad = run(light)
@@ -468,12 +578,32 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
 
 
 _STAGE = []
+MINI_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+_MINI_BASE = []
+
+
+def mini_opts(plan):
+    """Options for the miniature max_nodes test: only when every changed line is known."""
+    if NOMINI or not plan.lines_ok or plan.overlay or plan.import_probe or plan.renames or not plan.lines:
+        return None
+    if any(not p.startswith("sqlglot/") or not p.endswith(".py") for p in plan.files):
+        return None
+    if not _MINI_BASE:
+        try:
+            with open(os.path.join(os.path.dirname(MAPS), "mini_base.txt")) as f:
+                _MINI_BASE.append(int(f.read().strip() or 0) or None)
+        except Exception:
+            _MINI_BASE.append(None)
+    if _MINI_BASE[0] is None:
+        return None
+    return {"changed": {p: sorted(ls) for p, ls in plan.lines.items()}, "base": _MINI_BASE[0]}
+
 
 
 def exec_memo_ok(plan, fx):
     """Which executor memo level is valid: "A" (whole query) when no changed line runs inside
     sqlglot.executor.execute, "B" (plan execution) when none runs inside PythonExecutor.execute."""
-    if fx is not None:
+    if fx is not None or os.environ.get("BR_NOEXECMEMO"):
         return False         # fixture text changed: queries differ; let them run
     if not hot.eligible(plan) or not plan.lines_ok:
         return False
@@ -515,9 +645,30 @@ def fixture_only(plan, ts, allow):
     return out
 
 
+CASCADE_PLAN = [None]
+
+
+def cascade_possible(plan, M):
+    """A class-wide pool breaks only when patched code raises while a task or its reply is pickled or
+    unpickled. If every changed line is known and none runs inside that stage, it cannot happen."""
+    if plan is None or not plan.lines_ok or plan.overlay or plan.import_probe or plan.renames:
+        return True
+    pk = getattr(M, "pk_lines", None)
+    if pk is None:
+        return True
+    if any(not p.endswith(".py") for p in plan.files):
+        return True
+    for path, ls in plan.lines.items():
+        if path.startswith("tests/") or (pk.get(path) and (pk[path] & ls)):
+            return True
+    return False
+
+
 def cascade(not_run, M, num_of):
     """Pool users we did not execute could break their class-wide pool; later pool users would then fail."""
     out = []
+    if not cascade_possible(CASCADE_PLAN[0], M):
+        return out
     for cl, users in M.pool_users.items():
         firsts = [t.rsplit("::", 1)[-1] for t in not_run if t in users]
         if firsts:
@@ -550,7 +701,11 @@ def main():
             a = resource.getrusage(resource.RUSAGE_SELF); b = resource.getrusage(resource.RUSAGE_CHILDREN)
             now = (a.ru_utime + a.ru_stime, b.ru_utime + b.ru_stime)
             prev = getattr(main, "_cpu", (0, 0)); main._cpu = now
-            log(cid, "CPU self %.3f child %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], len(getattr(plan, "executed", ()) or ()) if plan else -1))
+            zc = _ZY[0].total_cpu() if _ZY else 0.0
+            zp = getattr(main, "_zcpu", 0.0); main._zcpu = zc
+            log(cid, "CPU self %.3f child %.3f zygote %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], zc - zp, len(getattr(plan, "executed", ()) or ()) if plan else -1))
+        if plan is not None and plan.must:
+            nums = sorted(set(nums) | {num_of[M.tests[i]] for i in plan.must if M.tests[i] in num_of})
         workers, cost = packer.pack(set(nums), secs_ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG and plan is not None:

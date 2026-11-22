@@ -276,6 +276,14 @@ class Plan:
         self.lines = {}            # path -> old lines touched by in-function changes
         self.lines_ok = True       # False when some change is not captured by `lines`
         self.data_files = {}       # changed data file -> (old text, new text)
+        self.ranges = {}           # path -> (old line ranges, new line ranges) touched by the patch
+        self.attr_keys = set()     # "module:Class.attr" keys the patch assigns; None when not expressible
+        self.attr_rt = set()       # tests that read those attributes at run time
+        self.attr_change = False   # some module/class-level statement changed (import state surely differs)
+        self.must = set()          # included whatever execution says (the overlay cannot be trusted for them)
+        self.header_funcs = set()  # "module:qualname" of functions whose def header changed
+        self.rt = set()            # candidates justified by run-time execution alone
+        self.fp_ok = True          # False when some change is not plain sqlglot code or data
         self.data_cands = set()    # candidates that read a changed data file (almost surely failing)
 
     def why(self, s):
@@ -333,6 +341,8 @@ def _file(fc, M, plan):
         plan.why("%s: mode change only" % fc.path)
         return
     # ---- renames / copies -------------------------------------------------
+    if (fc.rename and old != new) or fc.binary:
+        plan.fp_ok = False
     if fc.rename and old != new:
         plan.renames.append((old, new))
         plan.overlay = True
@@ -397,7 +407,8 @@ def _file(fc, M, plan):
         return
     plan.files[path] = content
     if path.endswith(".py"):
-        _python(path, src, content, M, plan, patchlib.changed_ranges(fc))
+        plan.ranges[path] = patchlib.changed_ranges(fc)
+        _python(path, src, content, M, plan, plan.ranges[path])
     else:
         plan.data_files[path] = (src, content)
         _data(path, M, plan)
@@ -406,7 +417,10 @@ def _file(fc, M, plan):
 def _data(path, M, plan):
     r = M.readers(path)
     plan.cands |= r
+    plan.rt |= r
     plan.data_cands |= r
+    if not path.startswith("tests/"):
+        plan.must |= r   # tests reach such files through resolved paths that leave the overlay
     plan.why("%s: data file -> %d readers" % (path, len(r)))
     base = os.path.basename(path)
     if base in PYTEST_CFG or path in M.collect_files:
@@ -415,14 +429,52 @@ def _data(path, M, plan):
         if base in PYTEST_CFG and (path.count("/") == 0 or path.startswith("tests/")):
             old, new = plan.data_files.get(path, (None, None))
             if base in ("setup.cfg", "pyproject.toml", "tox.ini") and old is not None and new is not None \
-                    and "pytest" not in old.lower() and "pytest" not in new.lower():
+                    and _cfg_parses(base, new) and _pytest_cfg(base, old) == _pytest_cfg(base, new):
                 plan.why("%s: configuration without any pytest section" % path)
             else:
                 plan.all = True
                 plan.why("%s: pytest configuration" % path)
 
 
+def _pytest_cfg(base, text):
+    """The part of a configuration file pytest reads, in comparable form."""
+    try:
+        if base.endswith(".toml"):
+            import tomllib
+            d = tomllib.loads(text)
+            tool = d.get("tool", {}) if isinstance(d.get("tool", {}), dict) else {}
+            return repr(sorted((k, repr(v)) for k, v in tool.items() if "pytest" in k))
+        import configparser
+        cp = configparser.RawConfigParser(strict=False)
+        cp.read_string(text)
+        return repr(sorted((sec, sorted(cp.items(sec))) for sec in cp.sections() if "pytest" in sec.lower()))
+    except Exception:
+        return "unparsable:" + text
+
+
+def _cfg_parses(base, text):
+    """Does the configuration file still parse the way pytest will read it?"""
+    try:
+        if base.endswith(".toml"):
+            import tomllib
+            tomllib.loads(text)
+            return True
+        import re
+        for line in text.split("\n"):
+            if not line.strip() or line.lstrip().startswith(("#", ";")):
+                continue
+            if line[:1] in (" ", "\t"):
+                continue                      # continuation of the previous value
+            if re.match(r"^\[[^\]]+\]\s*$", line) or re.match(r"^[^=:\[\]]+[=:]", line):
+                continue
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _added(path, M, plan, content):
+    plan.fp_ok = False
     base = os.path.basename(path)
     top = path.split("/")[0]
     if base in PYTEST_CFG and (path.count("/") == 0 or top == "tests"):
@@ -462,6 +514,7 @@ def _added(path, M, plan, content):
 
 
 def _removed(path, M, plan, why):
+    plan.fp_ok = False
     if path.endswith(".py"):
         if is_test_module(path):
             ts = M.by_file.get(path, set())
@@ -485,10 +538,13 @@ def _eager(path, M):
 def _python(path, old, new, M, plan, ranges=None):
     md = pydiff.diff_module(old, new, ranges)
     in_tests = path.startswith("tests/")
+    if in_tests or not path.startswith("sqlglot/"):
+        plan.fp_ok = False
     known = path in M.lines or path in M.imp or path in M.imports or in_tests
     if md.same:
         r = M.readers(path)
         plan.cands |= r
+        plan.rt |= r
         plan.why("%s: AST-identical -> %d source readers" % (path, len(r)))
         if old.split("\n", 2)[:2] != new.split("\n", 2)[:2] or old[:1] == "\ufeff" or new[:1] == "\ufeff":
             # an encoding declaration lives in the first two lines; the interpreter decodes bytes with it
@@ -500,8 +556,12 @@ def _python(path, old, new, M, plan, ranges=None):
             plan.why("%s: first lines changed (encoding declaration?) -> import probe" % path)
         if r:
             plan.overlay = True
+        elif path not in plan.import_probe and not in_tests:
+            plan.files.pop(path, None)   # behaves exactly like the pinned file: no need to materialise it
+            plan.ranges.pop(path, None)
         return
     if md.syntax_error:
+        plan.fp_ok = False
         if is_test_module(path):
             ts = M.by_file.get(path, set())
             plan.cands |= ts
@@ -510,15 +570,18 @@ def _python(path, old, new, M, plan, ranges=None):
             plan.all = True
             plan.why("%s: eagerly imported module broken" % path)
         return
-    if not known and not path.startswith(("sqlglot/", "tests/")):
-        r = M.readers(path)
+    if not path.startswith(("sqlglot/", "tests/")):
+        r = M.readers(path) | M.users_module(path)
+        plan.fp_ok = False
         plan.cands |= r
+        plan.must |= r
         plan.overlay = True
         plan.why("%s: python outside packages -> %d readers" % (path, len(r)))
         return
     r = M.readers(path)
     if r:
         plan.cands |= r
+        plan.rt |= r
         plan.overlay = True
         plan.why("%s: %d tests read this source file" % (path, len(r)))
     for fc in md.funcs:
@@ -541,6 +604,7 @@ def _python(path, old, new, M, plan, ranges=None):
                 plan.sites_only = False
         else:
             plan.sites_only = False
+        plan.rt |= c
         imp_mods = set()
         d = M.imp.get(path, {})
         span = range(fc.start, fc.end + 1)
@@ -550,6 +614,7 @@ def _python(path, old, new, M, plan, ranges=None):
         if fc.header:
             # def-time objects (defaults/decorators) changed
             imp_mods.add(path)
+            plan.header_funcs.add("%s:%s" % (M.mod(path), fc.qual))
         if imp_mods:
             plan.overlay = True
             for m in imp_mods:
@@ -568,6 +633,7 @@ def _python(path, old, new, M, plan, ranges=None):
     for ic in md.imports:
         plan.overlay = True
         plan.lines_ok = False
+        plan.attr_change = True
         c = _import_change(path, ic, M, plan)
         plan.cands |= c
 
@@ -601,6 +667,26 @@ def _import_change(path, ic, M, plan):
             c = broad
         plan.why("%s[%s]: %s (no names) -> %d" % (path, ic.scope, ic.what, len(c)))
         return c
+    # attribute-exact view for the import-state fingerprint: who reads these names at run time
+    if names and ic.what.startswith("changed") and not in_tests and plan.attr_keys is not None:
+        art = set()
+        nsite = 0
+        for nm in names:
+            for (f, l, col) in M.name_sites(nm):
+                if f == path and ic.lines and ic.lines[0] <= l <= ic.lines[1]:
+                    continue
+                nsite += 1
+                if M.is_deferred(f, l, col):
+                    art |= M.cover(f, (l,))   # function code: whoever runs it at run time may read the value
+            plan.attr_keys.add("%s:%s%s" % (M.mod(path), (ic.scope + ".") if ic.scope else "", nm))
+        if nsite == 0:
+            plan.attr_keys = None       # reached only dynamically: cannot narrow
+        else:
+            if fam is not None:
+                art &= fam
+            plan.attr_rt |= art
+    else:
+        plan.attr_keys = None
     restricted = set()
     unrestricted = False
     seen_sites = 0
