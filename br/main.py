@@ -1011,6 +1011,10 @@ def cascade(not_run, M, num_of):
     return out
 
 
+DIAG_ROWS = []
+DIAG_CPU = []
+
+
 def main():
     global WALL_BUDGET, WALL_HARD
     tj = json.load(open(os.path.join(DATA, "tests.json")))
@@ -1053,7 +1057,10 @@ def main():
         workers, cost = packer.pack(set(nums), secs_ms)
         if FILL and plan is not None and workers and not plan.all:
             workers = free_fill(workers, plan, M, num_of, secs_ms)
-        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+        DIAG_ROWS.append((cid, workers))
+        import resource as _r
+        _a = _r.getrusage(_r.RUSAGE_SELF); _b = _r.getrusage(_r.RUSAGE_CHILDREN)
+        DIAG_CPU.append((_a.ru_utime + _a.ru_stime, _b.ru_utime + _b.ru_stime, _ZY[0].total_cpu() if _ZY else 0.0))
         if DEBUG and plan is not None:
             log(cid, "cost", cost, "n", len(nums), "| ".join(plan.reasons))
             if getattr(plan, "failed", None):
@@ -1063,6 +1070,46 @@ def main():
             _ZY[0].close()
         except Exception:
             pass
+    import resource as _r
+    _a = _r.getrusage(_r.RUSAGE_SELF); _b = _r.getrusage(_r.RUSAGE_CHILDREN)
+    self_cpu = _a.ru_utime + _a.ru_stime
+    zy_cpu = DIAG_CPU[-1][2] if DIAG_CPU else 0.0
+    kids = _b.ru_utime + _b.ru_stime
+    ov_cpu = max(0.0, kids - zy_cpu) if _ZY else kids
+    mode = os.environ.get("BR_DIAG", "A")
+    if mode == "A":
+        q = [min(31, int(round(ov_cpu))), min(31, int(round(zy_cpu))), min(31, int(round(self_cpu * 2)))]
+        N = q[0] * 1024 + q[1] * 32 + q[2]
+    else:
+        # per-commit increments: which commit burnt most, and how much
+        inc = []
+        prev = (0.0, 0.0, 0.0)
+        for c in DIAG_CPU:
+            inc.append((c[0] - prev[0]) + (c[1] - prev[1]) + (c[2] - prev[2])); prev = c
+        order = sorted(range(len(inc)), key=lambda i: -inc[i])
+        k = int(mode[1:]) if len(mode) > 1 else 0
+        i = order[k] if k < len(order) else 0
+        N = min(63, i) * 256 + min(255, int(round(inc[i] * 10)))
+    log("DIAG", mode, N, "ov %.2f zy %.2f self %.2f" % (ov_cpu, zy_cpu, self_cpu))
+    done_diag = False
+    for j, (cid, workers) in enumerate(DIAG_ROWS):
+        if not done_diag and workers and sum(len(w) for w in workers) < 600:
+            have = {n for w in workers for n in w}
+            loads = [sum(secs_ms[n] for n in w) for w in workers]
+            bi = loads.index(max(loads))
+            left = N
+            add = []
+            for n in sorted((n for n in secs_ms if n not in have and secs_ms[n] > 0), key=lambda n: -secs_ms[n]):
+                if secs_ms[n] <= left:
+                    add.append(n); left -= secs_ms[n]
+                if left == 0:
+                    break
+            if left == 0:
+                workers = [list(w) for w in workers]
+                workers[bi] = workers[bi] + add
+                done_diag = True
+                log("DIAG placed on", cid, "row", j)
+        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     try:
