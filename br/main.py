@@ -252,6 +252,167 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     return set(res["failing"])
 
 
+_OV = {}   # the patched-tree child that serves the commit being decided
+PERSIST = not os.environ.get("BR_NOPERSIST")
+
+
+def ov_close():
+    """Stop the patched-tree child of the current commit, if there is one."""
+    st = _OV.pop("st", None)
+    if not st:
+        return
+    import signal
+    import shutil
+    for fd in (st["w"], st["r"]):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        os.kill(st["pid"], signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        os.waitpid(st["pid"], 0)
+    except OSError:
+        pass
+    shutil.rmtree(st["root"], ignore_errors=True)
+
+
+def execute_served(cid, plan, ids, limits, timeout, allow=None, mini=None, fp=False):
+    """Like execute(), but one child per commit serves every batch of that commit: the patched tree
+    is built and imported once instead of once per batch."""
+    timeout = min(timeout, wall_left() - 2.0)
+    if timeout < 2.0:
+        log("no wall time left for a child", cid)
+        return None
+    st = _OV.get("st")
+    if st is not None and st["cid"] != cid:
+        ov_close()
+        st = None
+    if st is None:
+        preimport(ids)
+        root = os.path.join(TMP, "ov_" + cid)
+        try:
+            overlay.build(SRC, root, plan.files, plan.renames)
+        except Exception as e:
+            log("overlay failed", cid, repr(e))
+            return None
+        jr, jw = os.pipe()     # parent -> child: jobs
+        rr, rw = os.pipe()     # child -> parent: results
+        _prefork()
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                os.close(jw)
+                os.close(rr)
+                devnull = os.open(os.devnull, os.O_RDWR)
+                os.dup2(devnull, 0)
+                os.dup2(devnull, 1)
+                if not DEBUG:
+                    os.dup2(devnull, 2)
+                os.chdir(root)
+                sys.path.insert(0, root)
+                from . import inlinepool, runner
+                runner.cap_memory()
+                inlinepool.install()
+                runner.MEMO_OK = not plan.renames and not any(p.startswith("tests/") for p in plan.files)
+                broken = []
+                bad_imports = None
+                fp_before = None
+                if fp:
+                    # same import order as when the baseline fingerprint was taken
+                    try:
+                        from . import fingerprint
+                        fp_before = fingerprint.process_state()
+                        bad_imports = fingerprint.import_all()
+                    except BaseException:  # noqa
+                        bad_imports = None
+                for path in sorted(plan.import_probe):
+                    if not path.endswith(".py"):
+                        continue
+                    name = path[:-3].replace("/", ".")
+                    if name.endswith(".__init__"):
+                        name = name[:-9]
+                    try:
+                        __import__(name)
+                    except BaseException:  # noqa
+                        broken.append(path)
+                changed = None
+                if fp and not broken:
+                    # did importing the patched code leave any state different from the pinned tree's?
+                    try:
+                        from . import fingerprint
+                        base = fingerprint.load()
+                        if base is not None and bad_imports is not None:
+                            mods, defs = fingerprint.changed_attrs(base, fp_before)
+                            if sorted(bad_imports) != sorted(base["failed"]):
+                                mods.append("<imports>")
+                            changed = [mods[:200], defs[:200]]
+                    except BaseException:  # noqa
+                        changed = None
+                if fp and FREEZE:
+                    # everything imported for the fingerprint stays for the life of this child:
+                    # keep the collector from walking it during the tests
+                    import gc
+                    gc.collect()
+                    gc.freeze()
+                while True:
+                    job = hot._recv(jr)
+                    if job is None:
+                        code = 0
+                        break
+                    if broken:
+                        hot._send(rw, {"failing": [], "info": {"import_broken": broken}, "broken": broken})
+                        continue
+                    if not job["ids"]:
+                        hot._send(rw, {"failing": [], "info": {}, "broken": [], "fp": changed})
+                        continue
+                    runner.MINI = job.get("mini")
+                    if job.get("allow"):
+                        from . import slices as _s
+                        _s.ALLOW.clear()
+                        _s.ALLOW.update({k: set(v) for k, v in job["allow"].items()})
+                        _s.install()
+                    bad, info = runner.run_ids(job["ids"], job.get("limits") or {})
+                    hot._send(rw, {"failing": sorted(bad), "info": info, "broken": [], "fp": changed})
+            except BaseException as e:  # noqa
+                try:
+                    hot._send(rw, {"error": repr(e)})
+                except Exception:
+                    pass
+            finally:
+                os._exit(code)
+        _postfork()
+        os.close(jr)
+        os.close(rw)
+        st = _OV["st"] = {"cid": cid, "pid": pid, "w": jw, "r": rr, "root": root}
+    res = None
+    try:
+        hot._send(st["w"], {"ids": list(ids), "limits": limits or {}, "mini": mini,
+                            "allow": {k: sorted(v) for k, v in (allow or {}).items()}})
+        res = hot._recv(st["r"], timeout)
+    except OSError as e:
+        log("exec pipe trouble", cid, repr(e))
+        res = None
+    if not res or "error" in res:
+        log("exec trouble", cid, (res or {}).get("error", "no result/timeout"))
+        ov_close()
+        return None
+    LAST_FP[0] = res.get("fp")
+    LAST_INFO.clear()
+    LAST_INFO.update(res.get("info") or {})
+    if res.get("info"):
+        log("exec info", cid, res["info"])
+    if res.get("broken"):
+        ov_close()
+        return "BROKEN"
+    if LAST_INFO.get("timeouts") or LAST_INFO.get("pool_broken"):
+        ov_close()      # a child that saw a hang does not serve another batch
+    return set(res["failing"])
+
+
 _SL = []
 
 
@@ -549,7 +710,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                     gain = max(gain, FP_MIN_GAIN_MS)
         if gain >= FP_MIN_GAIN_MS:
             LAST_FP[0] = None
-            r = execute(cid, plan, [], {}, 25.0, fp=True)
+            r = (execute_served if PERSIST else execute)(cid, plan, [], {}, 25.0, fp=True)
             if r is None or r == "BROKEN":
                 log(cid, "import broken -> broad", len(broad))
                 return broad, plan
@@ -765,7 +926,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             if dropped and not ts2:
                 LAST_INFO.clear()
                 return set(dropped)
-            bad = execute(cid, plan, ts2, limits, timeout, allow, mini=mini)
+            bad = (execute_served if PERSIST else execute)(cid, plan, ts2, limits, timeout, allow, mini=mini)
             if dropped and isinstance(bad, set):
                 bad = set(bad) | set(dropped)
         return bad
@@ -1050,6 +1211,10 @@ def main():
         except Exception as e:  # last line of defence: never crash, never miss
             log("FATAL", cid, repr(e))
             nums, plan = [t["number"] for t in tests], None
+        try:
+            ov_close()
+        except Exception as e:
+            log("closing the child failed", cid, repr(e))
         if DEBUG:
             import resource
             a = resource.getrusage(resource.RUSAGE_SELF); b = resource.getrusage(resource.RUSAGE_CHILDREN)

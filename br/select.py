@@ -374,7 +374,8 @@ def _same_ast(path, fc):
     try:
         old = read_src(path)
         new = patchlib.apply(old, fc)
-        return ast.dump(ast.parse(old)) == ast.dump(ast.parse(new))
+        from . import astcache as _astcache
+        return ast.dump(_astcache.parse(old)) == ast.dump(_astcache.parse(new))
     except Exception:
         return False
 

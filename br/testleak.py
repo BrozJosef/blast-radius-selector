@@ -8,6 +8,7 @@ old and new test file and reports whether any added, removed or changed statemen
 It errs on the side of "yes": then every test is selected.
 """
 import ast
+from . import astcache as _astcache
 import collections
 
 _MUTATORS = {"update", "pop", "popitem", "clear", "append", "extend", "insert", "remove", "add", "discard",
@@ -125,13 +126,13 @@ def _stmt_may_leak(scope, fn, st):
 
 def may_leak(old, new):
     try:
-        tb = ast.parse(new)
+        tb = _astcache.parse(new)
     except SyntaxError:
         return False        # the file cannot be imported at all: none of its code runs
     except Exception:
         return True
     try:
-        ua, ub = _units(ast.parse(old)), _units(tb)
+        ua, ub = _units(_astcache.parse(old)), _units(tb)
     except Exception:
         return True
     ca = collections.Counter((sc, fn, _key(st)) for sc, fn, st in ua)
@@ -247,11 +248,11 @@ def changed_state_writers(old, new, ranges_old):
     """Names of functions that overlap the changed old lines and write shared state (in either version)."""
     out = []
     try:
-        ta = ast.parse(old)
+        ta = _astcache.parse(old)
     except Exception:
         return ["<unparsable>"]
     try:
-        tb = ast.parse(new)
+        tb = _astcache.parse(new)
     except Exception:
         tb = None
     new_by_name = {}
@@ -261,6 +262,12 @@ def changed_state_writers(old, new, ranges_old):
                 new_by_name.setdefault(n.name, []).append(n)
     def visit(node, outer):
         for ch in ast.iter_child_nodes(node):
+            hi = getattr(ch, "end_lineno", None)
+            if hi is not None:
+                # a function that overlaps the changed lines can only sit inside nodes that do
+                lo_ = min([ch.lineno] + [d.lineno for d in getattr(ch, "decorator_list", ())])
+                if not any(a <= hi and b >= lo_ for a, b in ranges_old):
+                    continue
             if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 lo = min([ch.lineno] + [d.lineno for d in ch.decorator_list])
                 if any(a <= ch.end_lineno and b >= lo for a, b in ranges_old):

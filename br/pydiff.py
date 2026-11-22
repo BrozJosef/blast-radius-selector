@@ -5,6 +5,7 @@ Classifies every difference as either
   * a change evaluated at import time (module or class body statement, def header) -> ImportChange
 """
 import ast
+from . import astcache as _astcache
 from difflib import SequenceMatcher
 
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -445,12 +446,12 @@ def diff_module(old_src, new_src, ranges=None):
     d = _Differ(ranges)
     md = d.md
     try:
-        to = ast.parse(old_src)
+        to = _astcache.parse(old_src)
     except (SyntaxError, ValueError):
         md.old_syntax_error = True
         to = None
     try:
-        tn = ast.parse(new_src)
+        tn = _astcache.parse(new_src)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         md.syntax_error = True
         return md
