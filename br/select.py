@@ -45,6 +45,7 @@ class _PerKey:
 
 class Maps:
     def __init__(self, path):
+        self.path = path
         with open(path, "rb") as f:
             d = pickle.load(f)
         self._lazy = {k: d.pop(k) for k in d.pop("__lazy__")}
@@ -166,7 +167,23 @@ class Maps:
         out = set(self.users_module(f))
         for g in self.importers(f, transitive):
             out |= self.users_module(g)
+        if transitive:
+            # every test file whose import really loads f (measured in a fresh process per file):
+            # covers lazy package attributes and other imports no import statement names
+            for tf in self.closure().get(f, ()):
+                out |= self.by_file.get(tf, set())
         return out
+
+    def closure(self):
+        c = self.__dict__.get("_closure")
+        if c is None:
+            try:
+                with open(os.path.join(os.path.dirname(self.path), "closure.bin"), "rb") as fh:
+                    c = pickle.loads(zlib.decompress(fh.read()))
+            except Exception:
+                c = {}
+            self.__dict__["_closure"] = c
+        return c
 
     def is_deferred(self, f, line, col=None):
         """Is this position inside a function or lambda body (code that runs when called)?"""
