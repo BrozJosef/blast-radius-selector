@@ -123,7 +123,10 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
-MEMCAP_MB = int(_os.environ.get("BR_MEMCAP_MB", "2200"))   # 0 switches the cap off
+# A data-segment limit also counts thread stacks and allocator arenas, so it can fail tests that
+# start threads (duckdb) well below real memory pressure: off unless asked for. The child still
+# volunteers as the first process to go if the container runs out of memory.
+MEMCAP_MB = int(_os.environ.get("BR_MEMCAP_MB", "0"))
 
 
 def cap_memory(extra=None):

@@ -38,6 +38,13 @@ def _prefork():
         import gc
         gc.freeze()
 
+
+def _postfork():
+    """In the parent, after the fork: let its own objects be collected again."""
+    # Unfreezing would make the next collection in this long-lived process walk its whole heap
+    # again; what it accumulates per commit is small, so the frozen set is simply left to grow.
+    return
+
 def _const_sig(c):
     if isinstance(c, types.CodeType):
         return ("<code>", c.co_name)
@@ -436,6 +443,8 @@ class _Server:
         r, w = os.pipe()
         _prefork()
         pid = os.fork()
+        if pid:
+            _postfork()
         if pid == 0:
             code = 1
             try:
@@ -549,6 +558,8 @@ class Zygote:
         from_r, from_w = os.pipe()  # zygote -> parent
         _prefork()
         pid = os.fork()
+        if pid:
+            _postfork()
         if pid == 0:
             try:
                 os.close(to_w)

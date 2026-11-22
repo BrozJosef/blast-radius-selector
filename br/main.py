@@ -59,6 +59,13 @@ def _prefork():
         import gc
         gc.freeze()
 
+
+def _postfork():
+    """In the parent, after the fork: let its own objects be collected again."""
+    # Unfreezing would make the next collection in this long-lived process walk its whole heap
+    # again; what it accumulates per commit is small, so the frozen set is simply left to grow.
+    return
+
 def zygote():
     if not _ZY:
         preimport(["tests/test_optimizer.py"])   # so the zygote inherits the heavy third-party imports
@@ -124,6 +131,8 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     r, w = os.pipe()
     _prefork()
     pid = os.fork()
+    if pid:
+        _postfork()
     if pid == 0:
         code = 1
         try:
@@ -739,7 +748,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 LAST_INFO.update(getattr(zygote(), "last_info", None) or {})
                 if bad is None:
                     log(cid, "hot fallback:", why)
-                    if "timeout" in str(why):
+                    if "timeout" in str(why) or "unresponsive" in str(why):
                         return None      # do not burn the same time again in an overlay child
             except Exception as e:
                 log(cid, "hot error", repr(e))
@@ -864,7 +873,10 @@ def free_fill(workers, plan, M, num_of, secs_ms):
         for n in pool:
             if n in chosen:
                 continue
-            j = min(range(len(workers)), key=lambda i: (loads[i], i))
+            live = [i for i in range(len(workers)) if workers[i]]
+            if not live:
+                break
+            j = min(live, key=lambda i: (loads[i], i))
             if loads[j] + secs_ms[n] <= cap:
                 workers[j].append(n)
                 loads[j] += secs_ms[n]
