@@ -8,6 +8,8 @@ import unittest
 FAIL_FAST = True
 MINI = None      # {"changed": {path: [lines]}, "base": work count} when the miniature max_nodes test may stand in
 MAX_TIMEOUTS = 2
+import os as _os
+GC_MODE = _os.environ.get("BR_GC", "off")   # "on" keeps automatic cycle collection
 
 
 class _Abort(Exception):
@@ -127,6 +129,14 @@ def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
     info = {}
     by_class = {}
     install_logging()
+    if GC_MODE != "on":
+        # these runs are short-lived processes: collecting reference cycles while they run is pure
+        # overhead (explicit gc.collect() calls in tests still work)
+        import gc
+        if GC_MODE == "off":
+            gc.disable()
+        else:
+            gc.set_threshold(200000, 50, 50)
     if MINI is not None:
         from . import maxnodes_mini
         if maxnodes_mini.TEST_ID in ids:

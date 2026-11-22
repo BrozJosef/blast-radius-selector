@@ -242,7 +242,8 @@ _ST = []
 
 _CK = []
 NORULES = bool(os.environ.get("BR_NORULES"))
-NOCK = not os.environ.get("BR_CK")   # entry-level table narrowing: off until its adversarial round is in
+NOCK = bool(os.environ.get("BR_NOCK"))
+CK_MIN_SAVE_MS = float(os.environ.get("BR_CK_MIN_SAVE_MS", "5000"))
 
 
 def ck_readers(plan, changed, M):
@@ -499,12 +500,15 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
         rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
         gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
-        if plan.attr_change and plan.attr_keys and not NONARROW:
-            # what traced readers of the assigned constants would leave if the fingerprint agrees
+        if plan.attr_change and plan.attr_keys and cand_ids:
+            # what the traced readers of the assigned constants would leave if the fingerprint agrees:
+            # worth its import-and-digest child only when it spares a lot of verification
             ck0 = ck_readers(plan, sorted(plan.attr_keys), M)
             if ck0 is not None:
-                ck_ids = [M.tests[i] for i in (plan.rt | ck0) if M.tests[i] in num_of]
-                gain = max(gain, 2 * (packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(ck_ids)), secs_ms)[1])) if cand_ids else 0
+                keep_ids = {M.tests[i] for i in (plan.rt | ck0)}
+                spared = sum(M.cpu.get(t, secs_ms[num_of[t]]) for t in cand_ids if t not in keep_ids) * CPU_SCALE
+                if spared >= CK_MIN_SAVE_MS:
+                    gain = max(gain, FP_MIN_GAIN_MS)
         if gain >= FP_MIN_GAIN_MS:
             LAST_FP[0] = None
             r = execute(cid, plan, [], {}, 25.0, fp=True)
@@ -514,8 +518,11 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             fpres = LAST_FP[0]
             same = bool(fpres) and fpres[0] == [] and set(fpres[1]) <= plan.header_funcs
             narrowed = False
-            if (not same and not NONARROW and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
-                    and set(fpres[0]) <= plan.attr_keys and set(fpres[1]) <= plan.header_funcs):
+            only_attrs = (not same and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
+                          and set(fpres[0]) <= plan.attr_keys and set(fpres[1]) <= plan.header_funcs)
+            if only_attrs and NONARROW and ck_readers(plan, fpres[0], M) is None:
+                only_attrs = False       # name-site narrowing is switched off; only traced readers may narrow
+            if only_attrs:
                 # only the attributes the patch assigns differ: nothing was derived from them at import,
                 # so only tests that read them at run time can see the change
                 narrowed = True
@@ -736,6 +743,10 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             heavy = rest[k2:] + sorted(sure)
     plan.executed = light
     plan.failed = bad
+    if DEBUG:
+        cs = sorted(((cpu.get(t, 0.0), t.split("::")[-1]) for t in light), reverse=True)
+        log(cid, "RANSET n=%d cpu_ms=%.0f big(>=50ms)=%.0f top=%s" % (
+            len(cs), sum(c for c, _ in cs), sum(c for c, _ in cs if c >= 50), [(round(c), n) for c, n in cs[:4]]))
     plan.allow = allow
     # Unrun pool users could, in principle, hang their class-wide pool. When the patched code has just
     # run to completion in other tests without a single timeout and the change is confined to function
