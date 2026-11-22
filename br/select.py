@@ -395,6 +395,18 @@ def _guard(fc, M, plan):
                     ts |= set(v)
             plan.must |= ts
             plan.why("%s: package init of %d tests" % (p, len(ts)))
+        if in_place and p.endswith(".py") and top == "sqlglot":
+            from . import testleak
+            try:
+                src = read_src(p)
+                writers = testleak.changed_state_writers(src, patchlib.apply(src, fc), patchlib.changed_ranges(fc)[0])
+            except Exception:
+                writers = ["<unknown>"]
+            if writers and not _same_ast(p, fc):
+                # the edit sits in code that fills a registry or cache shared by the whole process:
+                # tests that never run it can fail later in the session, in an order-dependent way
+                plan.all = True
+                plan.why("%s: edit in code that writes process-wide state (%s)" % (p, ", ".join(writers[:3])))
         if in_place and p.endswith(".py") and top == "tests":
             from . import testleak
             try:

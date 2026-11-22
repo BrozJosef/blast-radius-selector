@@ -142,3 +142,88 @@ def may_leak(old, new):
             if mine[k] > other.get(k, 0) and _stmt_may_leak(sc, fn, st):
                 return True
     return False
+
+
+# ---- library code that writes process-wide state ---------------------------------------------------
+# A patch inside a function that fills a registry or cache shared by the whole process (a class-level
+# or module-level table, an lru_cache) can poison that state for tests that never run the changed
+# line themselves; whether they fail then depends on the order of the pytest session.
+_CACHE_DECOS = {"lru_cache", "cache"}
+_WRITE_CALLS = {"update", "pop", "popitem", "clear", "append", "extend", "insert", "remove", "add", "discard",
+                "setdefault", "sort", "reverse", "register"}
+
+
+def _locals_of(fn):
+    names = {a.arg for a in fn.args.args + fn.args.kwonlyargs + fn.args.posonlyargs}
+    if fn.args.vararg:
+        names.add(fn.args.vararg.arg)
+    if fn.args.kwarg:
+        names.add(fn.args.kwarg.arg)
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            names.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
+            names.add(n.name)
+        elif isinstance(n, ast.alias):
+            names.add((n.asname or n.name).split(".")[0])
+    return names
+
+
+def writes_shared_state(fn):
+    """fn: ast.FunctionDef. True if its body can write a table that outlives the call and is not
+    reached through `self` or a local."""
+    for d in fn.decorator_list:
+        r = d.func if isinstance(d, ast.Call) else d
+        nm = r.attr if isinstance(r, ast.Attribute) else getattr(r, "id", None)
+        if nm in _CACHE_DECOS:
+            return True
+    loc = _locals_of(fn) - {"cls"}
+    loc.discard("self")
+
+    def shared(node):
+        root = _root_name(node)
+        return root is not None and root != "self" and root not in loc
+
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Global):
+            return True
+        if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            tg = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target]
+            for t in tg:
+                for leaf in (list(t.elts) if isinstance(t, (ast.Tuple, ast.List)) else [t]):
+                    if isinstance(leaf, (ast.Attribute, ast.Subscript)) and shared(leaf):
+                        return True
+        elif isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Name) and f.id in ("setattr", "delattr") and n.args and shared(n.args[0]):
+                return True
+            if isinstance(f, ast.Attribute) and f.attr in _WRITE_CALLS and shared(f.value):
+                return True
+    return False
+
+
+def changed_state_writers(old, new, ranges_old):
+    """Names of functions that overlap the changed old lines and write shared state (in either version)."""
+    out = []
+    try:
+        ta = ast.parse(old)
+    except Exception:
+        return ["<unparsable>"]
+    try:
+        tb = ast.parse(new)
+    except Exception:
+        tb = None
+    new_by_name = {}
+    if tb is not None:
+        for n in ast.walk(tb):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                new_by_name.setdefault(n.name, []).append(n)
+    for n in ast.walk(ta):
+        if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        lo = min([n.lineno] + [d.lineno for d in n.decorator_list])
+        if not any(a <= n.end_lineno and b >= lo for a, b in ranges_old):
+            continue
+        if writes_shared_state(n) or any(writes_shared_state(m) for m in new_by_name.get(n.name, ())):
+            out.append(n.name)
+    return out
