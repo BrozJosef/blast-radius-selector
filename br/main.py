@@ -39,6 +39,9 @@ SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
 INDEPENDENT = ("::test_generator_memory", "::test_cache_does_not_retain_queries")
 SECS_CAP = float(os.environ.get("BR_SECS_CAP", "0"))
+PROBE_N = int(os.environ.get("BR_PROBE_N", "0"))
+PROBE_FRAC = float(os.environ.get("BR_PROBE_FRAC", "0.5"))
+P_FAIL_PROBED = float(os.environ.get("BR_P_FAIL_PROBED", "0.9"))
 MISS_COST = 1500.0   # ms of real executor runs allowed after memo misses (memo.MISS_BUDGET)
 P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
 HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
@@ -46,7 +49,7 @@ INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
 _ZY = []
 
 
-FREEZE = bool(os.environ.get("BR_FREEZE"))
+FREEZE = not os.environ.get("BR_NOFREEZE")
 
 
 def _prefork():
@@ -100,8 +103,17 @@ def preimport(ids):
 LAST_FP = [None]
 
 
+def wall_left():
+    """Seconds until no child may still be running."""
+    return WALL_HARD - (time.time() - T0)
+
+
 def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
     """Fork a child that runs `ids` against the patched tree. Returns failing set or None on trouble."""
+    timeout = min(timeout, wall_left() - 2.0)
+    if timeout < 2.0:
+        log("no wall time left for a child", cid)
+        return None
     preimport(ids)
     root = os.path.join(TMP, "ov_" + cid)
     try:
@@ -124,6 +136,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
             os.chdir(root)
             sys.path.insert(0, root)
             from . import inlinepool, runner
+            runner.cap_memory()
             inlinepool.install()
             runner.MEMO_OK = not plan.renames and not any(p.startswith("tests/") for p in plan.files)
             runner.MINI = mini
@@ -709,7 +722,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 c = sl_est.get(t)
                 full = (cpu.get(t, secs_ms[num_of[t]]) if c is None else c) * CPU_SCALE
                 limits[t] = max(limits[t], 0.0013 * full + 5.0)
-        timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(15.0, 0.004 * total + 10.0))
+        timeout = min(wall_left() - 2.0, max(15.0, 0.004 * total + 10.0))
+        if timeout < 2.0:
+            return None
         bad = None
         fx = fixture_only(plan, ts, allow)
         if HOT and (fx is not None or hot.eligible(plan)):
@@ -718,7 +733,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 files = {} if fx is not None else {f: plan.files[f] for f in {f for f, _ in plan.hot}}
                 bad, why = zygote().run(cid, files, ts, limits, timeout, allow=allow, override=fx,
                                         opts={"exec_memo": exec_memo_ok(plan, fx), "mini": mini},
-                                        ranges={f: plan.ranges[f] for f in files if f in plan.ranges})
+                                        ranges={f: plan.ranges[f] for f in files if f in plan.ranges},
+                                        grace=wall_left() - timeout)
                 LAST_INFO.clear()
                 LAST_INFO.update(getattr(zygote(), "last_info", None) or {})
                 if bad is None:
@@ -733,8 +749,33 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         return bad
 
     timeouts = [0]
-    bad = run(light)
-    timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad is None else 0)
+    probe_cut = False
+    if PROBE_N and len(light) > 2 * PROBE_N:
+        # A change that has any effect tends to fail most of the tests that reach it. So ask a few
+        # of the cheapest first; if they already fail, the rest is better included than run.
+        probe = sorted(light, key=cost)[:PROBE_N]
+        bad = run(probe)
+        timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad is None else 0)
+        if isinstance(bad, set) and len(bad) >= max(1, int(PROBE_FRAC * len(probe))) and not LAST_INFO.get("pool_broken"):
+            pset = set(probe)
+            heavy = [t for t in light if t not in pset] + list(heavy)
+            light = probe
+            probe_cut = True
+        elif isinstance(bad, set):
+            pset = set(probe)
+            rest1 = [t for t in light if t not in pset]
+            pb = dict(LAST_INFO.get("pool_broken") or {})
+            bad1 = run(rest1) if rest1 else set()
+            timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad1 is None else 0)
+            if bad1 == "BROKEN" or bad1 is None:
+                bad = bad1
+            else:
+                bad = set(bad) | set(bad1)
+                pb.update(LAST_INFO.get("pool_broken") or {})
+                LAST_INFO["pool_broken"] = pb
+    else:
+        bad = run(light)
+        timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad is None else 0)
     if bad == "BROKEN":
         log(cid, "import broken -> broad", len(broad))
         return broad, plan
@@ -756,7 +797,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             indep = [t for t in rest if t.endswith(INDEPENDENT)]
             other = [t for t in rest if not t.endswith(INDEPENDENT)]
             ka = choose(indep, list(sure) + failed_ids + other, P_FAIL2, ran_classes) if indep else 0
-            kb = choose(other, list(sure) + failed_ids + indep[ka:], P_FAIL_AFTER, ran_classes) if other else 0
+            kb = choose(other, list(sure) + failed_ids + indep[ka:], P_FAIL_PROBED if probe_cut else P_FAIL_AFTER, ran_classes) if other else 0
             more = indep[:ka] + other[:kb]
             rest = more + indep[ka:] + other[kb:]
             k2 = len(more)
@@ -801,6 +842,34 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
 _STAGE = []
 MINI_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 _MINI_BASE = []
+
+
+FILL = not os.environ.get("BR_NOFILL")
+
+
+def free_fill(workers, plan, M, num_of, secs_ms):
+    """A commit costs its busiest worker plus a fixed amount per worker, so the other workers have
+    room up to the busiest one's load at no cost. Fill it with the remaining candidates (tests the
+    change could reach that were executed and passed, then the wider dependents): free insurance
+    against a verdict that would differ inside the organisers' full pytest session."""
+    workers = [list(w) for w in workers]
+    loads = [sum(secs_ms[n] for n in w) for w in workers]
+    cap = max(loads)
+    chosen = {n for w in workers for n in w}
+    pools = []
+    for grp in (plan.cands, plan.broad):
+        pools.append(sorted(({num_of[M.tests[i]] for i in grp if M.tests[i] in num_of} - chosen),
+                            key=lambda n: (secs_ms[n], n)))
+    for pool in pools:
+        for n in pool:
+            if n in chosen:
+                continue
+            j = min(range(len(workers)), key=lambda i: (loads[i], i))
+            if loads[j] + secs_ms[n] <= cap:
+                workers[j].append(n)
+                loads[j] += secs_ms[n]
+                chosen.add(n)
+    return workers
 
 
 def mini_opts(plan):
@@ -930,6 +999,9 @@ def main():
     M = select.Maps(MAPS)
     cdir = os.path.join(DATA, "commits")
     out = []
+    unknown_tests = {n for tid, n in num_of.items() if tid not in M.idx}
+    if unknown_tests:
+        log("tests unknown to the maps:", len(unknown_tests))
     if "BR_WALL" not in os.environ and sum(1 for x in os.listdir(cdir) if x.endswith(".patch")) >= 52:
         # the final batch is about one and a half times as long and gets 4.5 minutes instead of 3
         WALL_BUDGET, WALL_HARD = 200.0, 235.0
@@ -954,7 +1026,12 @@ def main():
             log(cid, "CPU self %.3f child %.3f zygote %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], zc - zp, len(getattr(plan, "executed", ()) or ()) if plan else -1))
         if plan is not None and plan.must:
             nums = sorted(set(nums) | {num_of[M.tests[i]] for i in plan.must if M.tests[i] in num_of})
+        if unknown_tests and (nums or (plan is not None and (plan.cands or plan.files))):
+            # tests the maps have never seen: nothing is known about what reaches them
+            nums = sorted(set(nums) | unknown_tests)
         workers, cost = packer.pack(set(nums), secs_ms)
+        if FILL and plan is not None and workers and not plan.all:
+            workers = free_fill(workers, plan, M, num_of, secs_ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG and plan is not None:
             log(cid, "cost", cost, "n", len(nums), "| ".join(plan.reasons))

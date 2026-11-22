@@ -352,6 +352,10 @@ def analyze(patch_text, M):
         plan.why("unparsable patch: %r" % (e,))
         return plan
     if not fcs:
+        if patch_text.strip():
+            plan.all = True          # something is there that the parser could not make sense of
+            plan.why("patch without recognisable file sections")
+            return plan
         plan.why("empty patch")
         return plan
     for fc in fcs:

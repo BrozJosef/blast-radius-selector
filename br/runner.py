@@ -123,6 +123,32 @@ def _alarm(signum, frame):
     raise Timeout()
 
 
+def cap_memory(extra=1536 << 20):
+    """Called in a freshly forked child: a runaway allocation in patched code must end as a
+    MemoryError in that test (which then fails and is included), not as the container's memory
+    limit. Also makes this child the kernel's first choice should memory run out anyway."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except Exception:
+        pass
+    try:
+        import resource
+        data = 0
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmData:"):
+                    data = int(line.split()[1]) * 1024
+                    break
+        soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+        want = data + extra
+        if hard != resource.RLIM_INFINITY:
+            want = min(want, hard)
+        resource.setrlimit(resource.RLIMIT_DATA, (want, hard))
+    except Exception:
+        pass
+
+
 def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
     """ids: 'tests/x.py::Class::method'. Returns (failing set, info dict)."""
     failing = set()

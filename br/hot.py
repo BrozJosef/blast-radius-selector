@@ -28,7 +28,7 @@ CO_VARFLAGS = 0x04 | 0x08                    # *args, **kwargs
 
 
 # --------------------------------------------------------------------------- code trees
-FREEZE = bool(os.environ.get("BR_FREEZE"))
+FREEZE = not os.environ.get("BR_NOFREEZE")
 
 
 def _prefork():
@@ -440,6 +440,8 @@ class _Server:
             code = 1
             try:
                 os.close(r)
+                from . import runner as _rn
+                _rn.cap_memory()
                 res = self.grandchild(files, olds, ids, job.get("limits"), before, job.get("allow"), job.get("override"), job.get("opts"))
                 _send(w, res)
                 code = 0
@@ -465,6 +467,11 @@ class _Server:
         try:
             os.waitpid(pid, 0)
         except OSError:
+            pass
+        try:
+            import shutil
+            shutil.rmtree(os.path.join(os.environ.get("BR_TMP", "/tmp"), "fx_%d" % pid), ignore_errors=True)
+        except Exception:  # noqa: BLE001
             pass
         if res is None:
             return {"cannot": "timeout or crash"}
@@ -588,7 +595,7 @@ class Zygote:
     def total_cpu(self):
         return self.cpu_dead + self.cpu
 
-    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None, override=None, opts=None, ranges=None):
+    def run(self, cid, files, ids, limits=None, timeout=60.0, allow=None, override=None, opts=None, ranges=None, grace=20.0):
         """files: {relpath: full new source}. Returns (failing set | None, reason)."""
         if self.pid is None:
             try:
@@ -601,7 +608,7 @@ class Zygote:
         except OSError as e:
             self.stop()
             return None, "zygote gone: %r" % (e,)
-        res = _recv(self.r, timeout + 20.0)
+        res = _recv(self.r, timeout + min(20.0, max(1.0, grace)))
         self.jobs += 1
         if res is None:
             self.stop()
