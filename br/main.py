@@ -245,8 +245,10 @@ NOCK = not os.environ.get("BR_CK")   # entry-level table narrowing: off until it
 
 
 def ck_readers(plan, changed, M):
-    """Tests (indexes) that read the changed entries of value-only dict edits; None when not applicable."""
-    if NOCK or not plan.ck or not changed or not (set(changed) <= set(plan.ck)):
+    """Tests (indexes) that read the changed class-level constants when traced one test per process:
+    for a value-only edit of a dict literal the readers of those entries (or of the whole table),
+    otherwise every reader of the attribute. None when some attribute was not traced."""
+    if NOCK or not changed:
         return None
     if not _CK:
         import pickle
@@ -262,14 +264,17 @@ def ck_readers(plan, changed, M):
         return None
     out = set(ck["untraced"])
     for key in changed:
-        idx, n = plan.ck[key]
         site = ck["sites"].get(key)
-        if site is None or site["n"] != n:
-            return None                    # not a table we traced, or its entries are not the literal's
+        if site is None:
+            return None                    # not an attribute we traced
         hits = site["hits"]
-        out |= set(hits.get(-1, ()))       # wholesale readers
-        for i in idx:
-            out |= set(hits.get(i, ()))
+        dv = (plan.ck or {}).get(key)
+        if dv is not None and site["n"] is not None and site["n"] == dv[1]:
+            out |= set(hits.get(-1, ()))   # wholesale readers of the table
+            for i in dv[0]:
+                out |= set(hits.get(i, ()))
+        else:
+            out |= set(hits.get(-3, ()))   # anyone who fetched the attribute
     return out
 
 
@@ -493,9 +498,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
         rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
         gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
-        if plan.attr_change and plan.ck and not NONARROW:
-            # value-only table edits: what entry-level readers would leave if the fingerprint agrees
-            ck0 = ck_readers(plan, sorted(plan.ck), M)
+        if plan.attr_change and plan.attr_keys and not NONARROW:
+            # what traced readers of the assigned constants would leave if the fingerprint agrees
+            ck0 = ck_readers(plan, sorted(plan.attr_keys), M)
             if ck0 is not None:
                 ck_ids = [M.tests[i] for i in (plan.rt | ck0) if M.tests[i] in num_of]
                 gain = max(gain, 2 * (packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(ck_ids)), secs_ms)[1])) if cand_ids else 0
