@@ -278,6 +278,7 @@ class Plan:
         self.data_files = {}       # changed data file -> (old text, new text)
         self.ranges = {}           # path -> (old line ranges, new line ranges) touched by the patch
         self.attr_keys = set()     # "module:Class.attr" keys the patch assigns; None when not expressible
+        self.ck = {}               # attr key -> (changed entry indexes, entry count) for value-only dict edits; None if any other kind
         self.attr_rt = set()       # tests that read those attributes at run time
         self.attr_classes = set()  # "module:Class" whose body the patch changes; None when not only that
         self.attr_change = False   # some module/class-level statement changed (import state surely differs)
@@ -691,14 +692,22 @@ def _import_change(path, ic, M, plan):
                 elif f.startswith("tests/"):
                     escaped = True            # read while a test module is imported: its copy is not fingerprinted
             plan.attr_keys.add("%s:%s%s" % (M.mod(path), (ic.scope + ".") if ic.scope else "", nm))
+            if plan.ck is not None:
+                dv = getattr(ic, "dict_vals", None)
+                if dv is not None and len(names) == 1:
+                    plan.ck["%s:%s.%s" % (M.mod(path), ic.scope, nm)] = (set(dv[0]), dv[1])
+                else:
+                    plan.ck = None
         if nsite == 0 or escaped:
             plan.attr_keys = None       # reached only dynamically, or copied out of our sight: cannot narrow
+            plan.ck = None
         else:
             if fam is not None:
                 art &= fam
             plan.attr_rt |= art
     else:
         plan.attr_keys = None
+        plan.ck = None
     restricted = set()
     unrestricted = False
     seen_sites = 0

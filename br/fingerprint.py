@@ -213,14 +213,14 @@ def digest_attrs(prefix="sqlglot"):
     return out, {k: sorted(v) for k, v in w.defaults.items()}, sorted(set(w.unknown))
 
 
-def changed_attrs(base):
+def changed_attrs(base, before=None):
     """(attribute keys whose import-time value differs, functions whose defaults differ)."""
     now, defaults, unknown = digest_attrs()
     b = base["attrs"]
     diff = sorted(k for k in set(now) | set(b) if now.get(k) is None or b.get(k) is None or now.get(k) != b.get(k))
     if set(unknown) - set(base.get("unknown", ())):
         diff.append("<opaque objects>")          # a kind of object the walker cannot see into appeared
-    if base.get("process") is not None and process_state() != base["process"]:
+    if base.get("process") is not None and not process_same(before, process_state(), base.get("process0"), base["process"]):
         diff.append("<process state>")
     bd = base.get("adefaults", {})
     dd = sorted("%s:%s" % k for k in set(bd) | set(defaults) if bd.get(k) != defaults.get(k))
@@ -228,7 +228,9 @@ def changed_attrs(base):
 
 
 def process_state():
-    """Interpreter and library state an import could alter without touching any sqlglot object."""
+    """Interpreter and library state an import could alter without touching any sqlglot object.
+    A tuple of fields; taken before and after the imports so that what the surrounding process
+    already looked like does not count as a difference."""
     import decimal
     import logging
     import warnings
@@ -237,9 +239,28 @@ def process_state():
     for n in names:
         lg = logging.getLogger(n)
         logs.append((n, lg.level, lg.disabled, lg.propagate, tuple(type(h).__name__ for h in lg.handlers)))
-    return repr((logging.root.manager.disable, logging.root.level, tuple(logs), sys.getrecursionlimit(),
-                 len(warnings.filters), repr(decimal.getcontext()), sys.getswitchinterval(),
-                 sys.flags.dev_mode, tuple(sorted(k for k in sys.modules if k.split(".")[0] in ("sqlglotc", "sqlglotrs")))))
+    return (logging.root.manager.disable, logging.root.level, tuple(logs), sys.getrecursionlimit(),
+            len(warnings.filters), repr(decimal.getcontext()), sys.getswitchinterval(),
+            sys.flags.dev_mode, tuple(sorted(k for k in sys.modules if k.split(".")[0] in ("sqlglotc", "sqlglotrs"))))
+
+
+_COUNT_FIELDS = (4,)   # len(warnings.filters): what matters is how many the imports added
+
+
+def process_same(before, after, base_before, base_after):
+    """True when the imports changed process state exactly as they do on the pinned tree."""
+    if not (isinstance(before, tuple) and isinstance(after, tuple) and isinstance(base_before, tuple)
+            and isinstance(base_after, tuple) and len(before) == len(after) == len(base_before) == len(base_after)):
+        return False
+    for i in range(len(after)):
+        if i in _COUNT_FIELDS:
+            if after[i] - before[i] != base_after[i] - base_before[i]:
+                return False
+        elif after[i] != base_after[i]:
+            # tolerated only if the field already differed before the imports and they left it alone
+            if not (before[i] == after[i] and base_before[i] == base_after[i]):
+                return False
+    return True
 
 
 def import_all():
@@ -283,12 +304,13 @@ def load():
 def build(out=PATH):
     import unittest  # noqa: F401  sqlglot records at import whether it runs under unittest; tests always do
     import unittest.mock  # noqa: F401
+    p0 = process_state()
     bad = import_all()
     d, unknown, defaults = digest_modules()
     attrs, adefaults, unknown2 = digest_attrs()
     with open(out, "wb") as f:
         pickle.dump({"digests": d, "failed": bad, "defaults": defaults, "attrs": attrs, "adefaults": adefaults,
-                     "unknown": sorted(set(unknown) | set(unknown2)), "process": process_state()}, f, protocol=5)
+                     "unknown": sorted(set(unknown) | set(unknown2)), "process": process_state(), "process0": p0}, f, protocol=5)
     print("attribute digests: %d" % len(attrs), file=sys.stderr)
     try:
         from . import maxnodes_mini

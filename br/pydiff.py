@@ -31,9 +31,10 @@ class FuncChange:
 
 
 class ImportChange:
-    __slots__ = ("scope", "names", "lines", "what")
+    __slots__ = ("scope", "names", "lines", "what", "dict_vals")
 
-    def __init__(self, scope, names, lines, what):
+    def __init__(self, scope, names, lines, what, dict_vals=None):
+        self.dict_vals = dict_vals  # (changed entry indexes, entry count) when only values of a dict literal changed
         self.scope = scope  # '' for module, 'A.B' for class body
         self.names = names  # set of assigned names, or None when unknown
         self.lines = lines  # (start, end) in old file, or None for pure insertions
@@ -41,6 +42,32 @@ class ImportChange:
 
     def __repr__(self):
         return "Import(%s names=%s lines=%s %s)" % (self.scope, self.names, self.lines, self.what)
+
+
+def _dict_value_change(a, b):
+    """For `NAME = {...}` on both sides with the same keys in the same order: which entries' values differ."""
+    try:
+        if type(a) is not type(b) or not isinstance(a, (ast.Assign, ast.AnnAssign)):
+            return None
+        ta = a.targets if isinstance(a, ast.Assign) else [a.target]
+        tb = b.targets if isinstance(b, ast.Assign) else [b.target]
+        if len(ta) != 1 or len(tb) != 1 or not isinstance(ta[0], ast.Name) or _dump(ta[0]) != _dump(tb[0]):
+            return None
+        if isinstance(a, ast.AnnAssign) and _dump(a.annotation) != _dump(b.annotation):
+            return None
+        va, vb = a.value, b.value
+        if not isinstance(va, ast.Dict) or not isinstance(vb, ast.Dict) or len(va.keys) != len(vb.keys):
+            return None
+        if any(k is None for k in va.keys) or any(k is None for k in vb.keys):
+            return None          # `**other` entries: positions are not the literal's
+        if [_dump(k) for k in va.keys] != [_dump(k) for k in vb.keys]:
+            return None
+        if any(not isinstance(k, (ast.Constant, ast.Attribute, ast.Name)) for k in va.keys):
+            return None          # computed keys could collide or be evaluated with side effects
+        idx = [i for i, (x, y) in enumerate(zip(va.values, vb.values)) if _dump(x) != _dump(y)]
+        return (idx, len(va.keys)) if idx else None
+    except Exception:
+        return None
 
 
 class ModDiff:
@@ -301,7 +328,8 @@ class _Differ:
                 return
         na, nb = _targets(a), _targets(b)
         names = None if na is None or nb is None else (na | nb)
-        self.md.imports.append(ImportChange(scope, names, _span(a), ("changed " if na == nb else "renamed ") + type(a).__name__))
+        self.md.imports.append(ImportChange(scope, names, _span(a), ("changed " if na == nb else "renamed ") + type(a).__name__,
+                                            _dict_value_change(a, b) if na == nb else None))
 
     def _headers_equal(self, a, b):
         if isinstance(a, ast.If) or isinstance(a, ast.While):

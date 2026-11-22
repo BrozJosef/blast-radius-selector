@@ -41,6 +41,11 @@ How it works:
    code that runs during import but the digests are equal, only tests that
    execute the changed lines at run time can be affected; when only the assigned
    attribute differs, only tests that read it at run time can.
+   The comparison of interpreter-level state is taken as a before/after
+   difference so that the surrounding process does not count. For edits that
+   change only values of a class-level dict literal, `maps/ck.bin` records per
+   test which entries of each such table were looked up (traced once on the
+   pinned commit); this entry-level narrowing is behind `BR_CK=1` for now.
 8. `br/maxnodes_mini.py` is a scaled-down run of `test_max_nodes` (same
    statements, 30 columns instead of 10,000). The 29-second original is included
    only if the patch touches the node-limit lines, the scaled run fails, or it

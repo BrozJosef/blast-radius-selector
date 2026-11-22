@@ -22,7 +22,7 @@ DEBUG = os.environ.get("BR_DEBUG")
 # policy knobs
 RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "20000"))    # never execute a test slower than this
 RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "30000"))
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.6"))   # offline CPU map -> expected CPU on the scorer
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.0"))   # offline CPU map -> expected CPU on the scorer
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.3"))  # nor a batch bigger than this
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))                  # stop executing after this many seconds
 WALL_HARD = float(os.environ.get("BR_WALL_HARD", "165"))               # no child may run past this
@@ -125,6 +125,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
                 # same import order as when the baseline fingerprint was taken
                 try:
                     from . import fingerprint
+                    fp_before = fingerprint.process_state()
                     bad_imports = fingerprint.import_all()
                 except BaseException:  # noqa
                     bad_imports = None
@@ -145,7 +146,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
                     from . import fingerprint
                     base = fingerprint.load()
                     if base is not None and bad_imports is not None:
-                        mods, defs = fingerprint.changed_attrs(base)
+                        mods, defs = fingerprint.changed_attrs(base, fp_before)
                         if sorted(bad_imports) != sorted(base["failed"]):
                             mods.append("<imports>")
                         changed = [mods[:200], defs[:200]]
@@ -237,6 +238,39 @@ _SV = []
 
 
 _ST = []
+
+
+_CK = []
+NOCK = not os.environ.get("BR_CK")   # entry-level table narrowing: off until its adversarial round is in
+
+
+def ck_readers(plan, changed, M):
+    """Tests (indexes) that read the changed entries of value-only dict edits; None when not applicable."""
+    if NOCK or not plan.ck or not changed or not (set(changed) <= set(plan.ck)):
+        return None
+    if not _CK:
+        import pickle
+        try:
+            import zlib
+            with open(os.path.join(os.path.dirname(MAPS), "ck.bin"), "rb") as f:
+                _CK.append(pickle.loads(zlib.decompress(f.read())))
+        except Exception as e:
+            log("no entry-level table profile", repr(e))
+            _CK.append(None)
+    ck = _CK[0]
+    if ck is None:
+        return None
+    out = set(ck["untraced"])
+    for key in changed:
+        idx, n = plan.ck[key]
+        site = ck["sites"].get(key)
+        if site is None or site["n"] != n:
+            return None                    # not a table we traced, or its entries are not the literal's
+        hits = site["hits"]
+        out |= set(hits.get(-1, ()))       # wholesale readers
+        for i in idx:
+            out |= set(hits.get(i, ()))
+    return out
 
 
 def slice_classes(plan, t):
@@ -459,6 +493,12 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
         rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
         gain = packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(rt_ids)), secs_ms)[1] if cand_ids else 0
+        if plan.attr_change and plan.ck and not NONARROW:
+            # value-only table edits: what entry-level readers would leave if the fingerprint agrees
+            ck0 = ck_readers(plan, sorted(plan.ck), M)
+            if ck0 is not None:
+                ck_ids = [M.tests[i] for i in (plan.rt | ck0) if M.tests[i] in num_of]
+                gain = max(gain, 2 * (packer.pack(set(incl(cand_ids)), secs_ms)[1] - packer.pack(set(incl(ck_ids)), secs_ms)[1])) if cand_ids else 0
         if gain >= FP_MIN_GAIN_MS:
             LAST_FP[0] = None
             r = execute(cid, plan, [], {}, 25.0, fp=True)
@@ -467,15 +507,24 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 return broad, plan
             fpres = LAST_FP[0]
             same = bool(fpres) and fpres[0] == [] and set(fpres[1]) <= plan.header_funcs
+            narrowed = False
             if (not same and not NONARROW and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
                     and set(fpres[0]) <= plan.attr_keys and set(fpres[1]) <= plan.header_funcs):
                 # only the attributes the patch assigns differ: nothing was derived from them at import,
                 # so only tests that read them at run time can see the change
-                art = [M.tests[i] for i in (plan.rt | plan.attr_rt) if M.tests[i] in num_of]
-                log(cid, "only %s changed at import: %d -> %d candidates" % (sorted(fpres[0])[:3], len(cand_ids), len(art)))
+                narrowed = True
+                readers = plan.rt | plan.attr_rt
+                ck = ck_readers(plan, fpres[0], M)
+                if ck is not None:
+                    # only values of dict literals changed: whoever looked those entries up (or read the
+                    # table wholesale) when traced, instead of everyone who touches the table
+                    readers = plan.rt | ck
+                    plan.why("entry-level readers of the changed table values")
+                art = [M.tests[i] for i in readers if M.tests[i] in num_of]
+                log(cid, "only %s changed at import: %d -> %d candidates%s" % (sorted(fpres[0])[:3], len(cand_ids), len(art), " (entry level)" if ck is not None else ""))
                 plan.why("import-time state differs only in the assigned attributes")
                 cand_ids = art
-                plan.cands = set(plan.rt | plan.attr_rt)
+                plan.cands = set(readers)
             elif same:
                 log(cid, "import-time state unchanged: %d -> %d candidates" % (len(cand_ids), len(rt_ids)))
                 plan.why("import-time state identical to the pinned tree")
@@ -483,10 +532,14 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 plan.cands = set(plan.rt)
             else:
                 log(cid, "import-time state differs in", (fpres[0][:5], fpres[1][:5]) if fpres else "?")
-            if cand_ids is not None and (same or plan.cands == set(plan.rt | plan.attr_rt)):
+            if cand_ids is not None and (same or narrowed):
                 # the digest is taken with every module loaded, so it cannot see a change in what
                 # `import sqlglot` alone loads; the one test that checks this is kept
-                plan.must |= {i for i, t in enumerate(M.tests) if t.endswith("::test_lazy_load")}
+                # (as a candidate: it is cheap to run against the patched tree)
+                for i, t in enumerate(M.tests):
+                    if t.endswith("::test_lazy_load") and t in num_of and t not in cand_ids:
+                        cand_ids = list(cand_ids) + [t]
+                        plan.cands = set(plan.cands) | {i}
             plan.import_probe = set()      # already probed
             fallback = incl(cand_ids)
     if not cand_ids:
@@ -603,6 +656,12 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         # past its expected time plus a margin, including the test is cheaper than waiting for it
         # a test gets about four times its expected CPU on the scorer before it counts as hung
         limits = {t: max(6.0, min(0.004 * cost(t), 0.0015 * cost(t) + 5.0)) for t in ts}
+        for t in ts:
+            if t.endswith("::test_execute_tpcds"):
+                # a patch that changes plans but not results misses the memo and runs at full length
+                c = sl_est.get(t)
+                full = (cpu.get(t, secs_ms[num_of[t]]) if c is None else c) * CPU_SCALE
+                limits[t] = max(limits[t], 0.0013 * full + 5.0)
         timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(15.0, 0.004 * total + 10.0))
         bad = None
         fx = fixture_only(plan, ts, allow)
@@ -771,6 +830,7 @@ def cascade(not_run, M, num_of):
 
 
 def main():
+    global WALL_BUDGET, WALL_HARD
     tj = json.load(open(os.path.join(DATA, "tests.json")))
     tests = tj["tests"]
     num_of = {t["id"]: t["number"] for t in tests}
@@ -778,6 +838,9 @@ def main():
     M = select.Maps(MAPS)
     cdir = os.path.join(DATA, "commits")
     out = []
+    if "BR_WALL" not in os.environ and sum(1 for x in os.listdir(cdir) if x.endswith(".patch")) >= 52:
+        # the final batch is about one and a half times as long and gets 4.5 minutes instead of 3
+        WALL_BUDGET, WALL_HARD = 200.0, 235.0
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
