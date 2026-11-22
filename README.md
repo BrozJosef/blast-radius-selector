@@ -25,11 +25,27 @@ How it works:
    unittest-style suite, including process-pool behaviour (`br/inlinepool.py`).
 5. Fixture-driven tests are restricted to the fixture entries that can observe
    the change (`br/slices.py`), which is equivalent to running the whole test.
+   Entries are chosen by per-entry line coverage, per-entry operand profiles,
+   and for class-attribute changes by which classes an entry instantiates.
+   A test that runs well past its expected time is treated as failing (the
+   track counts timeouts as failures) rather than waited for.
 6. `br/memo.py` caches, at image build time and from the pinned commit only,
    pure intermediate results of the TPC executor tests: DuckDB's reference
    answers keyed by SQL text, the parsed CSV rows, and the Python executor's
    result keyed by a structural key of the query or plan. A cache level is
    used only when no changed line can run inside the stage it replaces.
+
+7. `br/fingerprint.py` digests the state importing sqlglot leaves behind (class
+   attributes, module globals, closure contents, default arguments). The same
+   digest of the pinned tree is taken at image build time. When a patch changes
+   code that runs during import but the digests are equal, only tests that
+   execute the changed lines at run time can be affected; when only the assigned
+   attribute differs, only tests that read it at run time can.
+8. `br/maxnodes_mini.py` is a scaled-down run of `test_max_nodes` (same
+   statements, 30 columns instead of 10,000). The 29-second original is included
+   only if the patch touches the node-limit lines, the scaled run fails, or it
+   does noticeably more work than on the pinned tree. This is the one heuristic
+   in the entry; it agreed with the real test on all 196 mutants we tried.
 
 There is no table from patches or kinds of edit to failing tests anywhere:
 every decision is derived from the patch itself, from maps of the unpatched

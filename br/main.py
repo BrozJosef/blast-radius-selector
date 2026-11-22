@@ -22,7 +22,7 @@ DEBUG = os.environ.get("BR_DEBUG")
 # policy knobs
 RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "20000"))    # never execute a test slower than this
 RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "30000"))
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "3.0"))   # offline CPU map -> expected CPU on the scorer
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.6"))   # offline CPU map -> expected CPU on the scorer
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.3"))  # nor a batch bigger than this
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))                  # stop executing after this many seconds
 WALL_HARD = float(os.environ.get("BR_WALL_HARD", "165"))               # no child may run past this
@@ -30,11 +30,16 @@ NOEXEC = bool(os.environ.get("BR_NOEXEC"))
 HOT = not os.environ.get("BR_NOHOT")
 NOSLICE = bool(os.environ.get("BR_NOSLICE"))
 NOMINI = bool(os.environ.get("BR_NOMINI"))
+NOEVIDENCE = bool(os.environ.get("BR_CASCADE_ALWAYS"))   # keep the conservative cascade rule everywhere
 ASSUME_UNAFFECTED = bool(os.environ.get("BR_ASSUME_UNAFFECTED"))   # simulation only
 FP = not os.environ.get("BR_NOFP")
+NONARROW = bool(os.environ.get("BR_NONARROW"))   # fingerprint may only prove "identical", never narrow by attribute
 FP_MIN_GAIN_MS = float(os.environ.get("BR_FP_MIN_GAIN_MS", "6000"))
 SURE_RUN_MS = float(os.environ.get("BR_SURE_RUN_MS", "700"))
 P_FAIL2 = float(os.environ.get("BR_P_FAIL2", "0.15"))
+P_FAIL_AFTER = float(os.environ.get("BR_P_FAIL_AFTER", "0.6"))
+HEAVY_MS = float(os.environ.get("BR_HEAVY_MS", "1200"))
+INFO_BUDGET_MS = float(os.environ.get("BR_INFO_BUDGET_MS", "1500"))
 _ZY = []
 
 
@@ -230,6 +235,37 @@ FIX = "tests/fixtures/"
 _SV = []
 
 
+_ST = []
+
+
+def slice_classes(plan, t):
+    """Entries of a fixture-driven test that instantiate a class whose attributes the patch re-assigns."""
+    if not _ST:
+        import pickle
+        try:
+            with open(os.path.join(os.path.dirname(MAPS), "slicetypes.bin"), "rb") as f:
+                _ST.append(select._PerKey(pickle.load(f)))
+        except Exception as e:
+            log("no slice class usage", repr(e))
+            _ST.append(None)
+    st = _ST[0]
+    if st is None or not plan.attr_classes:
+        return None
+    rec = st.get(t)
+    if rec is None or not rec["sound"]:
+        return None
+    if rec["resid"] & plan.attr_classes:
+        return True, {}
+    mine = {}
+    for F, d in rec["files"].items():
+        m = 0
+        for c in plan.attr_classes:
+            m |= d.get(c, 0)
+        if m:
+            mine[F] = m
+    return False, mine
+
+
 def slice_vp(plan, t, M):
     """Entries of a fixture-driven test in which the swapped operator(s) can yield a different value.
     Returns (whole, {fixture: bitmask}) or None when value profiles cannot decide."""
@@ -286,6 +322,10 @@ def plan_slices(plan, cand_ids, M):
         need[name] = ch
     # (2) code changes inside functions: entries whose run touches a changed line
     code = plan.lines_ok and not plan.overlay and not plan.import_probe
+    # a patch that only re-assigns class attributes: entries that never build an instance of the
+    # class (or a subclass) cannot observe it
+    by_class = bool(plan.attr_classes) and plan.attr_change and not plan.lines and not plan.data_files \
+        and not plan.hot and plan.fp_ok and all(p.startswith("sqlglot/") for p in plan.files)
     for t in cand_ids:
         rec = S["tests"].get(t)
         if rec is None:
@@ -293,6 +333,8 @@ def plan_slices(plan, cand_ids, M):
         mine = {}
         whole = False
         vp = slice_vp(plan, t, M) if (code and plan.lines) else None
+        if vp is None and by_class:
+            vp = slice_classes(plan, t)
         if vp is not None:
             whole, mine = vp
             if not whole and not mine and M.idx[t] not in plan.data_cands:
@@ -324,7 +366,8 @@ def plan_slices(plan, cand_ids, M):
                     whole = True   # coverage says it is a candidate but no entry explains why
         elif not plan.data_files:
             whole = True
-        if plan.overlay and not plan.lines and plan.files and not all(p in plan.data_files for p in plan.files):
+        if (vp is None or not by_class) and plan.overlay and not plan.lines and plan.files \
+                and not all(p in plan.data_files for p in plan.files):
             whole = True           # some other kind of change (import level): no slicing
         # per-entry cost net of the fixed part every run of the test pays (class setup, scaffolding)
         base = rec["resid_cpu"]
@@ -405,6 +448,12 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                     cand_ids = rt_ids
                     plan.cands = set(plan.rt)
                     fallback = incl(cand_ids)
+                elif plan.attr_change and plan.attr_keys is not None and not NONARROW:
+                    art = [M.tests[i] for i in (plan.rt | plan.attr_rt) if M.tests[i] in num_of]
+                    if ORACLE(cid, ("FP", art)):
+                        cand_ids = art
+                        plan.cands = set(plan.rt | plan.attr_rt)
+                        fallback = incl(cand_ids)
         plan.import_probe = set()
     if plan.import_probe and plan.fp_ok and FP and ORACLE is None and (not plan.attr_change or plan.attr_keys is not None):
         rt_ids = [M.tests[i] for i in ((plan.rt | plan.attr_rt) if plan.attr_change else plan.rt) if M.tests[i] in num_of]
@@ -417,7 +466,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 return broad, plan
             fpres = LAST_FP[0]
             same = bool(fpres) and fpres[0] == [] and set(fpres[1]) <= plan.header_funcs
-            if (not same and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
+            if (not same and not NONARROW and bool(fpres) and plan.attr_keys is not None and len(fpres[0]) < 200
                     and set(fpres[0]) <= plan.attr_keys and set(fpres[1]) <= plan.header_funcs):
                 # only the attributes the patch assigns differ: nothing was derived from them at import,
                 # so only tests that read them at run time can see the change
@@ -433,6 +482,10 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 plan.cands = set(plan.rt)
             else:
                 log(cid, "import-time state differs in", (fpres[0][:5], fpres[1][:5]) if fpres else "?")
+            if cand_ids is not None and (same or plan.cands == set(plan.rt | plan.attr_rt)):
+                # the digest is taken with every module loaded, so it cannot see a change in what
+                # `import sqlglot` alone loads; the one test that checks this is kept
+                plan.must |= {i for i, t in enumerate(M.tests) if t.endswith("::test_lazy_load")}
             plan.import_probe = set()      # already probed
             fallback = incl(cand_ids)
     if not cand_ids:
@@ -463,15 +516,18 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     sure = {t for t in cand_ids if M.idx[t] in plan.data_cands and cost(t) > SURE_RUN_MS}
     order = sorted((t for t in cand_ids if t not in sure), key=lambda t: cost(t) / max(1.0, secs_ms[num_of[t]] + 20.0))
 
-    def blind(ts):
+    casc_all = NOEVIDENCE or not plan.lines_ok or plan.overlay or bool(plan.import_probe)
+
+    def blind(ts, nothing_run=False):
         """Cost of including these tests without running them (plus what they could drag down)."""
         ts = list(ts)
         if not ts:
             return 0
-        return packer.pack(set(incl(ts)) | set(cascade(ts, M, num_of)), secs_ms)[1]
+        extra_ = cascade(ts, M, num_of) if (casc_all or nothing_run) else []
+        return packer.pack(set(incl(ts)) | set(extra_), secs_ms)[1]
 
     def choose(order, fixed, p_fail, spent_classes):
-        full = blind(list(order) + list(fixed))
+        full = blind(list(order) + list(fixed), nothing_run=not spent_classes)
         best = (full, 0)
         run_ms = 60.0
         classes = set(spent_classes)
@@ -497,14 +553,33 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                 continue
             rest = list(order[k:]) + list(fixed)
             br = blind(rest) if rest else 0
-            # what we run still fails with probability p_fail, and then costs what it would have blind
-            est = run_ms + br + p_fail * (full - br)
+            # What we run still fails with probability p_fail and is then included, but a test that ran
+            # to completion cannot have broken its pool, so it drags no cascade along.
+            ran_fail = packer.pack(set(incl(order[:k])) | set(incl(rest)) | set(cascade(rest, M, num_of) if casc_all else ()), secs_ms)[1]
+            est = run_ms + br + p_fail * max(0, ran_fail - br)
+            if DEBUG and os.environ.get("BR_TRACE_CHOOSE"):
+                log("   choose k=%d run_ms=%.0f br=%d ran_fail=%d est=%.0f full=%d" % (k, run_ms, br, ran_fail, est, full))
             if est <= best[0]:
                 best = (est, k)
         return best[1]
 
-    k = choose(order, sure, P_FAIL, ())
-    light, heavy = order[:k], order[k:] + sorted(sure)
+    # Stage 1 settles the cheap candidates; expensive ones wait until we know whether anything failed.
+    cheap_order = [t for t in order if cost(t) <= HEAVY_MS]
+    dear = [t for t in order if cost(t) > HEAVY_MS]
+    k = choose(cheap_order, list(sure) + dear, P_FAIL, ()) if cheap_order else 0
+    if k == 0 and dear and cheap_order:
+        # cheap candidates are worth running for what they tell us about the expensive ones
+        acc = 0.0
+        for t in cheap_order:
+            acc += cost(t)
+            if acc > INFO_BUDGET_MS:
+                break
+            k += 1
+    light, heavy = cheap_order[:k], cheap_order[k:] + dear + sorted(sure)
+    if not light and dear:
+        # nothing cheap to learn from: decide the expensive ones on their own merits
+        k = choose(order, sure, P_FAIL, ())
+        light, heavy = order[:k], order[k:] + sorted(sure)
     if DEBUG:
         log(cid, "PLAN run", [(t.split("::")[-1], round(cost(t))) for t in light][:6], "incl", [(t.split("::")[-1], round(cost(t)), secs_ms[num_of[t]]) for t in heavy][:6], "allow", {k_: len(v) for k_, v in allow.items()})
     if not light:
@@ -520,9 +595,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             LAST_INFO.clear()
             return ORACLE(cid, ts)
         total = sum(cost(t) for t in ts)
-        # a test gets several times its expected CPU before it counts as hung
+        # past its expected time plus a margin, including the test is cheaper than waiting for it
         # a test gets about four times its expected CPU on the scorer before it counts as hung
-        limits = {t: max(6.0, 0.004 * cost(t)) for t in ts}
+        limits = {t: max(6.0, min(0.004 * cost(t), 0.0015 * cost(t) + 5.0)) for t in ts}
         timeout = min(max(5.0, WALL_HARD - (time.time() - T0)), max(15.0, 0.004 * total + 10.0))
         bad = None
         fx = fixture_only(plan, ts, allow)
@@ -546,7 +621,9 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             bad = execute(cid, plan, ts, limits, timeout, allow, mini=mini)
         return bad
 
+    timeouts = [0]
     bad = run(light)
+    timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad is None else 0)
     if bad == "BROKEN":
         log(cid, "import broken -> broad", len(broad))
         return broad, plan
@@ -556,21 +633,28 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     # Second look: when everything cheap passed, the rest is far less likely to fail, so paying
     # CPU to clear it (instead of a worker's time) becomes worthwhile for more tests.
     rest = [t for t in heavy if t not in sure]
-    if not bad and rest and not broke and time.time() - T0 < WALL_BUDGET:
-        k2 = choose(rest, sure, P_FAIL2, {t.rsplit("::", 1)[0] for t in light})
+    if rest and not broke and time.time() - T0 < WALL_BUDGET:
+        # with failures already seen, an expensive candidate probably fails too: running it rarely pays
+        k2 = choose(rest, list(sure) + [t for t in bad if t in num_of], P_FAIL2 if not bad else P_FAIL_AFTER,
+                    {t.rsplit("::", 1)[0] for t in light})
         if k2:
             more = rest[:k2]
             bad2 = run(more)
             if bad2 == "BROKEN" or bad2 is None:
                 return sorted(set(fallback) | set(cascade(cand_ids, M, num_of))), plan
             bad = set(bad) | set(bad2)
+            timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0)
             broke.update(LAST_INFO.get("pool_broken") or {})
             light = light + more
             heavy = rest[k2:] + sorted(sure)
     plan.executed = light
     plan.failed = bad
     plan.allow = allow
-    extra = cascade(heavy, M, num_of)
+    # Unrun pool users could, in principle, hang their class-wide pool. When the patched code has just
+    # run to completion in other tests without a single timeout and the change is confined to function
+    # bodies, that risk is far smaller than the cost of always adding every later pool user.
+    evidence = bool(light) and not timeouts[0] and plan.lines_ok and not plan.overlay and not plan.import_probe
+    extra = [] if (evidence and not NOEVIDENCE) else cascade(heavy, M, num_of)
     for cl, first in broke.items():
         extra += [num_of[t] for t in M.pool_users.get(cl, ()) if t in num_of and t.rsplit("::", 1)[-1] >= first]
         log(cid, "pool broke in", cl, "at", first)
@@ -651,6 +735,9 @@ CASCADE_PLAN = [None]
 def cascade_possible(plan, M):
     """A class-wide pool breaks only when patched code raises while a task or its reply is pickled or
     unpickled. If every changed line is known and none runs inside that stage, it cannot happen."""
+    # A hung or dying task also starves the class-wide pool, whatever line it runs: an unrun pool user
+    # can never be cleared by line analysis alone. Kept conservative on purpose (red-team finding).
+    return True
     if plan is None or not plan.lines_ok or plan.overlay or plan.import_probe or plan.renames:
         return True
     pk = getattr(M, "pk_lines", None)

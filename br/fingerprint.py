@@ -50,7 +50,11 @@ class Walker:
                 ks = tuple(sorted(ks, key=repr))
             return ("l" if t is list else "t", ks)
         if t in (dict, types.MappingProxyType) or (isinstance(o, dict) and t.__module__ in ("collections", "builtins")):
-            return ("d", tuple(sorted(((repr(self.key(k, depth + 1)), self.key(v, depth + 1)) for k, v in list(o.items())),
+            items = list(o.items())
+            if all(type(k) is str for k, _ in items):
+                # string-keyed tables (arg_types, keyword maps): insertion order is behaviour
+                return ("do", tuple((k, self.key(v, depth + 1)) for k, v in items))
+            return ("d", tuple(sorted(((repr(self.key(k, depth + 1)), self.key(v, depth + 1)) for k, v in items),
                                       key=lambda kv: kv[0])))
         if t in (set, frozenset):
             return ("s", tuple(sorted((repr(self.key(x, depth + 1)) for x in o))))
@@ -117,6 +121,12 @@ class Walker:
         if isinstance(o, (functools.cached_property,)):
             return ("cp", self.key(o.func, depth + 1))
         mod = t.__module__ or ""
+        if mod == "logging":
+            import logging as _lg
+            if isinstance(o, _lg.Logger):
+                return ("log", o.name, o.level, o.disabled, o.propagate, tuple(type(h).__name__ for h in o.handlers))
+            if isinstance(o, _lg.Handler):
+                return ("logh", t.__name__, o.level)
         if mod.startswith("sqlglot"):
             d = None
             try:
@@ -208,9 +218,28 @@ def changed_attrs(base):
     now, defaults, unknown = digest_attrs()
     b = base["attrs"]
     diff = sorted(k for k in set(now) | set(b) if now.get(k) is None or b.get(k) is None or now.get(k) != b.get(k))
+    if set(unknown) - set(base.get("unknown", ())):
+        diff.append("<opaque objects>")          # a kind of object the walker cannot see into appeared
+    if base.get("process") is not None and process_state() != base["process"]:
+        diff.append("<process state>")
     bd = base.get("adefaults", {})
     dd = sorted("%s:%s" % k for k in set(bd) | set(defaults) if bd.get(k) != defaults.get(k))
     return diff, dd
+
+
+def process_state():
+    """Interpreter and library state an import could alter without touching any sqlglot object."""
+    import decimal
+    import logging
+    import warnings
+    names = sorted(n for n in logging.root.manager.loggerDict if n == "sqlglot" or n.startswith("sqlglot."))
+    logs = []
+    for n in names:
+        lg = logging.getLogger(n)
+        logs.append((n, lg.level, lg.disabled, lg.propagate, tuple(type(h).__name__ for h in lg.handlers)))
+    return repr((logging.root.manager.disable, logging.root.level, tuple(logs), sys.getrecursionlimit(),
+                 len(warnings.filters), repr(decimal.getcontext()), sys.getswitchinterval(),
+                 sys.flags.dev_mode, tuple(sorted(k for k in sys.modules if k.split(".")[0] in ("sqlglotc", "sqlglotrs")))))
 
 
 def import_all():
@@ -258,7 +287,8 @@ def build(out=PATH):
     d, unknown, defaults = digest_modules()
     attrs, adefaults, unknown2 = digest_attrs()
     with open(out, "wb") as f:
-        pickle.dump({"digests": d, "failed": bad, "defaults": defaults, "attrs": attrs, "adefaults": adefaults}, f, protocol=5)
+        pickle.dump({"digests": d, "failed": bad, "defaults": defaults, "attrs": attrs, "adefaults": adefaults,
+                     "unknown": sorted(set(unknown) | set(unknown2)), "process": process_state()}, f, protocol=5)
     print("attribute digests: %d" % len(attrs), file=sys.stderr)
     try:
         from . import maxnodes_mini

@@ -279,6 +279,7 @@ class Plan:
         self.ranges = {}           # path -> (old line ranges, new line ranges) touched by the patch
         self.attr_keys = set()     # "module:Class.attr" keys the patch assigns; None when not expressible
         self.attr_rt = set()       # tests that read those attributes at run time
+        self.attr_classes = set()  # "module:Class" whose body the patch changes; None when not only that
         self.attr_change = False   # some module/class-level statement changed (import state surely differs)
         self.must = set()          # included whatever execution says (the overlay cannot be trusted for them)
         self.header_funcs = set()  # "module:qualname" of functions whose def header changed
@@ -634,6 +635,11 @@ def _python(path, old, new, M, plan, ranges=None):
         plan.overlay = True
         plan.lines_ok = False
         plan.attr_change = True
+        if plan.attr_classes is not None:
+            if ic.scope and ic.names and ic.what.startswith("changed") and not in_tests:
+                plan.attr_classes.add("%s:%s" % (M.mod(path), ic.scope))
+            else:
+                plan.attr_classes = None
         c = _import_change(path, ic, M, plan)
         plan.cands |= c
 
@@ -661,6 +667,8 @@ def _import_change(path, ic, M, plan):
     else:
         fam = None
     names = ic.names
+    if not names or not ic.what.startswith("changed"):
+        plan.fp_ok = False     # a bare statement, or something added/removed: its effect may live anywhere
     if not names:
         c = broad if fam is None else (fam | set())
         if fam is None or ic.what == "class header":
@@ -668,9 +676,11 @@ def _import_change(path, ic, M, plan):
         plan.why("%s[%s]: %s (no names) -> %d" % (path, ic.scope, ic.what, len(c)))
         return c
     # attribute-exact view for the import-state fingerprint: who reads these names at run time
-    if names and ic.what.startswith("changed") and not in_tests and plan.attr_keys is not None:
+    # (class attributes only: a module-level name can be re-bound under another name by an import)
+    if names and ic.scope and ic.what.startswith("changed") and not in_tests and plan.attr_keys is not None:
         art = set()
         nsite = 0
+        escaped = False
         for nm in names:
             for (f, l, col) in M.name_sites(nm):
                 if f == path and ic.lines and ic.lines[0] <= l <= ic.lines[1]:
@@ -678,9 +688,11 @@ def _import_change(path, ic, M, plan):
                 nsite += 1
                 if M.is_deferred(f, l, col):
                     art |= M.cover(f, (l,))   # function code: whoever runs it at run time may read the value
+                elif f.startswith("tests/"):
+                    escaped = True            # read while a test module is imported: its copy is not fingerprinted
             plan.attr_keys.add("%s:%s%s" % (M.mod(path), (ic.scope + ".") if ic.scope else "", nm))
-        if nsite == 0:
-            plan.attr_keys = None       # reached only dynamically: cannot narrow
+        if nsite == 0 or escaped:
+            plan.attr_keys = None       # reached only dynamically, or copied out of our sight: cannot narrow
         else:
             if fam is not None:
                 art &= fam

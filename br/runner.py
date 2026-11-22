@@ -190,6 +190,7 @@ def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
             for m, tid in items:
                 failing.add(tid)
             info[f + "::" + c] = "timeout"
+            info["timeouts"] = info.get("timeouts", 0) + 1
             continue
         except BaseException as e:
             if isinstance(e, KeyboardInterrupt):
@@ -208,6 +209,8 @@ def run_ids(ids, limits=None, default_limit=30.0, setup_limit=30.0):
                     failing.add(idmap[case.id()])
             info[f + "::" + c] = "stopped after %d timeouts" % res.timeouts
             hung = True
+        if res.timeouts:
+            info["timeouts"] = info.get("timeouts", 0) + res.timeouts
         for uid in res.bad:
             if uid in idmap:
                 failing.add(idmap[uid])
