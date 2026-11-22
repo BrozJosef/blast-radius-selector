@@ -759,6 +759,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
 
     timeouts = [0]
     probe_cut = False
+    cut_rest = []
     if PROBE_N and len(light) > 2 * PROBE_N:
         # A change that has any effect tends to fail most of the tests that reach it. So ask a few
         # of the cheapest first; if they already fail, the rest is better included than run.
@@ -767,7 +768,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0) + (1 if bad is None else 0)
         if isinstance(bad, set) and len(bad) >= max(1, int(PROBE_FRAC * len(probe))) and not LAST_INFO.get("pool_broken"):
             pset = set(probe)
-            heavy = [t for t in light if t not in pset] + list(heavy)
+            cut_rest = [t for t in light if t not in pset]
+            heavy = cut_rest + list(heavy)
             light = probe
             probe_cut = True
         elif isinstance(bad, set):
@@ -795,7 +797,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     # CPU to clear it (instead of a worker's time) becomes worthwhile for more tests.
     seen_fail[0] = bool(bad)
     # best value first: CPU needed per second of worker time the test would otherwise occupy
-    rest = sorted((t for t in heavy if t not in sure), key=lambda t: cost(t) / max(1.0, secs_ms[num_of[t]] + 20.0))
+    cut_set = set(cut_rest)     # cheap candidates left unrun after a failing probe: included as they are
+    rest = sorted((t for t in heavy if t not in sure and t not in cut_set), key=lambda t: cost(t) / max(1.0, secs_ms[num_of[t]] + 20.0))
     if rest and not broke and time.time() - T0 < WALL_BUDGET:
         # with failures already seen, an expensive candidate probably fails too: running it rarely pays
         failed_ids = [t for t in bad if t in num_of]
@@ -805,8 +808,8 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             # just seen; decide them with the calm prior, the rest with the pessimistic one.
             indep = [t for t in rest if t.endswith(INDEPENDENT)]
             other = [t for t in rest if not t.endswith(INDEPENDENT)]
-            ka = choose(indep, list(sure) + failed_ids + other, P_FAIL2, ran_classes) if indep else 0
-            kb = choose(other, list(sure) + failed_ids + indep[ka:], P_FAIL_PROBED if probe_cut else P_FAIL_AFTER, ran_classes) if other else 0
+            ka = choose(indep, list(sure) + failed_ids + other + cut_rest, P_FAIL2, ran_classes) if indep else 0
+            kb = choose(other, list(sure) + failed_ids + indep[ka:] + cut_rest, P_FAIL_AFTER, ran_classes) if other else 0
             more = indep[:ka] + other[:kb]
             rest = more + indep[ka:] + other[kb:]
             k2 = len(more)
@@ -829,7 +832,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
             timeouts[0] += int(LAST_INFO.get("timeouts", 0) or 0)
             broke.update(LAST_INFO.get("pool_broken") or {})
             light = light + more
-            heavy = rest[k2:] + sorted(sure)
+            heavy = rest[k2:] + sorted(sure) + cut_rest
     plan.executed = light
     plan.failed = bad
     if DEBUG:
@@ -845,6 +848,12 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
     for cl, first in broke.items():
         extra += [num_of[t] for t in M.pool_users.get(cl, ()) if t in num_of and t.rsplit("::", 1)[-1] >= first]
         log(cid, "pool broke in", cl, "at", first)
+    # Invariant: every candidate was either executed or is included. Anything that slipped through
+    # the bookkeeping above is included.
+    lost = [t for t in cand_ids if t not in set(light) and t not in set(heavy)]
+    if lost:
+        log(cid, "bookkeeping lost %d candidates: included" % len(lost))
+        heavy = list(heavy) + lost
     return sorted(set(incl(heavy)) | {num_of[t] for t in bad if t in num_of} | set(extra)), plan
 
 
