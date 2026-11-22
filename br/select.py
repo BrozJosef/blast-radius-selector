@@ -371,7 +371,17 @@ def _guard(fc, M, plan):
         if base in PYTEST_CFG and (p.count("/") == 0 or top == "tests"):
             # collection / configuration: only an in-place text edit is analysed (in _data); a
             # conftest.py is code that pytest imports for every test below it
-            if structural or (base == "conftest.py" and not (in_place and _same_ast(p, fc))):
+            inert = False
+            if fc.deleted and not fc.binary and base in ("setup.cfg", "tox.ini") and p.count("/") == 0:
+                # deleting an ini-style file that has no pytest section takes nothing away from pytest
+                try:
+                    old = read_src(p)
+                    inert = _cfg_parses(base, old) and _pytest_cfg(base, old) == repr([])
+                except Exception:
+                    inert = False
+            if inert:
+                plan.why("%s: deleted configuration had no pytest section" % p)
+            elif structural or (base == "conftest.py" and not (in_place and _same_ast(p, fc))):
                 plan.all = True
                 plan.why("%s: pytest configuration added, removed, moved or rewritten" % p)
         if top == "tests" and base == "__init__.py" and not (in_place and _same_ast(p, fc)):
