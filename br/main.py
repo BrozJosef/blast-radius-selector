@@ -413,6 +413,7 @@ def main():
     tests = tj["tests"]
     num_of = {t["id"]: t["number"] for t in tests}
     secs_ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
+    id_of = {t["number"]: t["id"] for t in tests}
     M = select.Maps(MAPS)
     cdir = os.path.join(DATA, "commits")
     out = []
@@ -433,6 +434,9 @@ def main():
             now = (a.ru_utime + a.ru_stime, b.ru_utime + b.ru_stime)
             prev = getattr(main, "_cpu", (0, 0)); main._cpu = now
             log(cid, "CPU self %.3f child %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], len(getattr(plan, "executed", ()) or ()) if plan else -1))
+        drop = [x for x in os.environ.get("BR_PROBE_DROP", "").split(",") if x]
+        if drop and len(set(nums)) < len(tests):
+            nums = [n for n in nums if not any(d in id_of[n] for d in drop)]
         workers, cost = packer.pack(set(nums), secs_ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG and plan is not None:
