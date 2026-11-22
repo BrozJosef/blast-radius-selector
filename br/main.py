@@ -797,6 +797,11 @@ def main():
             zc = _ZY[0].total_cpu() if _ZY else 0.0
             zp = getattr(main, "_zcpu", 0.0); main._zcpu = zc
             log(cid, "CPU self %.3f child %.3f zygote %.3f | ran %d" % (now[0] - prev[0], now[1] - prev[1], zc - zp, len(getattr(plan, "executed", ()) or ()) if plan else -1))
+        if plan is not None and getattr(plan, "executed", None) is not None and not plan.all:
+            # diagnostic probe: keep only what failed when executed, plus readers of edited data files
+            keep = {num_of[t] for t in (getattr(plan, "failed", None) or ()) if t in num_of}
+            keep |= {num_of[M.tests[i]] for i in plan.data_cands if M.tests[i] in num_of}
+            nums = sorted(set(nums) & keep)
         if plan is not None and plan.must:
             nums = sorted(set(nums) | {num_of[M.tests[i]] for i in plan.must if M.tests[i] in num_of})
         workers, cost = packer.pack(set(nums), secs_ms)
