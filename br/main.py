@@ -718,7 +718,15 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
                     {t.rsplit("::", 1)[0] for t in light})
         if k2:
             more = rest[:k2]
+            t_s2 = time.process_time()
+            z_s2 = _ZY[0].total_cpu() if _ZY else 0.0
             bad2 = run(more)
+            if DEBUG:
+                log(cid, "STAGE2 after_fail=%d n=%d tpcds=%d failed_tpcds=%s nfail=%s zcpu=%.2f" % (
+                    int(bool(bad)), len(more), int(any(t.endswith("::test_execute_tpcds") for t in more)),
+                    (any(t.endswith("::test_execute_tpcds") for t in bad2) if isinstance(bad2, (set, list)) else "?"),
+                    (len(bad2) if isinstance(bad2, (set, list)) else "?"),
+                    (_ZY[0].total_cpu() if _ZY else 0.0) - z_s2))
             if bad2 == "BROKEN" or bad2 is None:
                 return sorted(set(fallback) | set(cascade(cand_ids, M, num_of))), plan
             bad = set(bad) | set(bad2)

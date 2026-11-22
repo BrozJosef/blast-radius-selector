@@ -157,10 +157,20 @@ def eligible(lines_by_path, stage):
     if not stage or "R" not in stage or "G" not in stage:
         return None
     G, R = stage["G"], stage["R"]
+    A = stage.get("A", {})
     hit = set()
     for path, ls in lines_by_path.items():
+        if not path.startswith("sqlglot/optimizer/"):
+            return None      # state shared between rules outside the tree (schema caches ...) lives elsewhere
         g = G.get(path)
         if g and (g & ls):
+            return None
+        # lines the query stage runs that the rule trace (a warm second pass) attributed to nobody:
+        # run-once code whose place in the pipeline is unknown
+        claimed = set(g or ())
+        for by_file in R.values():
+            claimed |= by_file.get(path, set())
+        if (A.get(path, set()) - claimed) & ls:
             return None
         for j, by_file in R.items():
             r = by_file.get(path)
