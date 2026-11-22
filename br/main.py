@@ -20,9 +20,12 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 DEBUG = os.environ.get("BR_DEBUG")
 
 # policy knobs
-RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "20000"))    # never execute a test slower than this
+# Never execute a test expected to cost more than this: at that price a pass saves little more than
+# it cost, and a failure or a hang (measured: 4 in 10 of such runs) loses all of it.
+RUN_MAX_TEST_MS = int(os.environ.get("BR_RUN_MAX_TEST_MS", "12000"))
 RUN_MAX_TOTAL_MS = int(os.environ.get("BR_RUN_MAX_TOTAL_MS", "30000"))
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.0"))   # offline CPU map -> expected CPU on the scorer
+LIMIT_FLOOR = float(os.environ.get("BR_LIMIT_FLOOR", "3.0"))   # seconds any test gets before it counts as hung
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.3"))  # nor a batch bigger than this
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))                  # stop executing after this many seconds
 WALL_HARD = float(os.environ.get("BR_WALL_HARD", "165"))               # no child may run past this
@@ -724,7 +727,7 @@ def decide(cid, patch_text, M, tests, num_of, secs_ms):
         total = sum(cost(t) for t in ts)
         # past its expected time plus a margin, including the test is cheaper than waiting for it
         # a test gets about four times its expected CPU on the scorer before it counts as hung
-        limits = {t: max(6.0, min(0.004 * cost(t), 0.0015 * cost(t) + 5.0)) for t in ts}
+        limits = {t: max(LIMIT_FLOOR, min(0.004 * cost(t), 0.0015 * cost(t) + 5.0)) for t in ts}
         for t in ts:
             if t.endswith("::test_execute_tpcds"):
                 # a patch that changes plans but not results misses the memo and runs at full length
