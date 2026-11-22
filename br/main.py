@@ -557,7 +557,8 @@ def main():
             ran = getattr(plan, "executed", None) or []
             failed = getattr(plan, "failed", None) or set()
             if mode == "failed_only":
-                nums = [num_of[t] for t in failed if t in num_of]
+                keep = {num_of[M.tests[i]] for i in plan.data_cands if M.tests[i] in num_of}   # fixture readers stay
+                nums = [num_of[t] for t in failed if t in num_of] + [n for n in nums if n in keep]
             elif mode == "trust_cheap" and ran and not failed:
                 nums = []
         drop = [x for x in os.environ.get("BR_PROBE_DROP", "").split(",") if x]
