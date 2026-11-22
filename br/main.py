@@ -108,6 +108,7 @@ def preimport(ids):
 
 
 LAST_FP = [None]
+EXEC_CALLS = [0]
 
 
 def wall_left():
@@ -122,6 +123,7 @@ def execute(cid, plan, ids, limits, timeout, allow=None, fp=False, mini=None):
         log("no wall time left for a child", cid)
         return None
     preimport(ids)
+    EXEC_CALLS[0] += 1
     root = os.path.join(TMP, "ov_" + cid)
     try:
         overlay.build(SRC, root, plan.files, plan.renames)
@@ -1012,6 +1014,7 @@ def cascade(not_run, M, num_of):
 
 
 DIAG_ROWS = []
+DIAG_FEAT = []
 DIAG_CPU = []
 
 
@@ -1061,6 +1064,8 @@ def main():
         import resource as _r
         _a = _r.getrusage(_r.RUSAGE_SELF); _b = _r.getrusage(_r.RUSAGE_CHILDREN)
         DIAG_CPU.append((_a.ru_utime + _a.ru_stime, _b.ru_utime + _b.ru_stime, _ZY[0].total_cpu() if _ZY else 0.0))
+        _ex = list(getattr(plan, "executed", ()) or ()) if plan is not None else []
+        DIAG_FEAT.append((EXEC_CALLS[0], int(any(t.endswith("::test_execute_tpcds") for t in _ex)), len(_ex)))
         if DEBUG and plan is not None:
             log(cid, "cost", cost, "n", len(nums), "| ".join(plan.reasons))
             if getattr(plan, "failed", None):
@@ -1087,7 +1092,15 @@ def main():
         for c in DIAG_CPU:
             inc.append((c[0] - prev[0]) + (c[1] - prev[1]) + (c[2] - prev[2])); prev = c
         order = sorted(range(len(inc)), key=lambda i: -inc[i])
-        if mode == "C":
+        if mode == "F":
+            # the three costliest commits: patched-tree child used? tpcds executed? how many tests ran?
+            N = 0
+            for i in order[:3]:
+                ov = int(DIAG_FEAT[i][0] > (DIAG_FEAT[i - 1][0] if i else 0))
+                n_ = DIAG_FEAT[i][2]
+                bucket = sum(1 for lim in (8, 32, 100, 300, 700, 1200, 2000) if n_ > lim)
+                N = N * 32 + ov * 16 + DIAG_FEAT[i][1] * 8 + bucket
+        elif mode == "C":
             top = [min(31, int(round(inc[i] * 2))) for i in order[:3]] + [0, 0, 0]
             N = top[0] * 1024 + top[1] * 32 + top[2]
         elif mode == "D":
